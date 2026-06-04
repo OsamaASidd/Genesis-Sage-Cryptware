@@ -16,6 +16,8 @@
         .header-title { font-size: 15px; font-weight: 600; }
         .header-subtitle { font-size: 11px; opacity: 0.7; }
         .header-env { background: var(--amber); color: white; font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 4px; }
+        .logout-btn { color: white; text-decoration: none; font-size: 12px; opacity: 0.8; border: 1px solid rgba(255,255,255,0.25); padding: 5px 12px; border-radius: 6px; transition: all 0.15s; }
+        .logout-btn:hover { opacity: 1; background: rgba(255,255,255,0.1); }
         .stats-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 20px 24px 0; }
         .stat-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); cursor: pointer; transition: box-shadow 0.15s; }
         .stat-card:hover { box-shadow: 0 3px 8px rgba(0,0,0,0.12); }
@@ -104,14 +106,16 @@
 
 <header class="header">
     <div class="header-left">
-        <div class="header-logo">PS</div>
+        <div class="header-logo">{{ entity_label[:2]|upper }}</div>
         <div>
-            <div class="header-title">E-Invoicing Dashboard</div>
+            <div class="header-title">{{ entity_label }}</div>
+            <div class="header-subtitle">E-Invoicing Dashboard</div>
         </div>
     </div>
     <div class="header-right" style="display:flex;align-items:center;gap:8px">
-        <button class="btn-ghost" onclick="openSettings()" title="Tax Category Settings" style="font-size:18px;padding:4px 8px">&#9881;</button>
+        <button class="btn-ghost" onclick="openSettings()" title="Tax Category Settings" style="font-size:18px;padding:4px 8px;color:white;border-color:rgba(255,255,255,0.25)">&#9881;</button>
         <span class="header-env">PRE-PROD</span>
+        <a href="/logout" class="logout-btn">Logout</a>
     </div>
 </header>
 
@@ -252,7 +256,7 @@
             {% if q or status_filter %}
                 No invoices match your search. <a href="/" style="color:var(--blue)">Clear filters</a>
             {% else %}
-                No invoices found. Click "Sync Date Range" to load from Sage Evolution.
+                No invoices found. Click "Sync Now" to load from Sage Evolution.
             {% endif %}
         </td></tr>
         {% endif %}
@@ -329,10 +333,6 @@
             <input id="setCatExempt" type="text" style="width:100%;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:14px" value="">
             <div style="font-size:10px;color:var(--slate400);margin-top:2px">Try: ZERO_RATE, EXEMPT, TAX_EXEMPT, E, Z, O, NTX, 06</div>
         </div>
-        <div style="margin:8px 0">
-            <button class="btn btn-sm" style="background:var(--navy);color:white;font-size:11px" onclick="fetchFlickCategories()">&#128269; Fetch Valid Categories from Cryptware API</button>
-            <pre id="flickCatResult" style="display:none;background:#f1f5f9;color:#334155;padding:10px;border-radius:6px;font-size:11px;margin-top:8px;max-height:200px;overflow:auto;white-space:pre-wrap"></pre>
-        </div>
         <div class="modal-footer">
             <button class="btn-ghost" onclick="closeSettings()">Cancel</button>
             <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save</button>
@@ -342,7 +342,6 @@
 
 <script>
 // Date pickers are pre-filled from server ({{ date_from }}, {{ date_to }})
-// Changing either triggers a page reload with the new range
 function applyDateRange() {
     var df = document.getElementById('dateFrom').value;
     var dt = document.getElementById('dateTo').value;
@@ -354,11 +353,9 @@ function applyDateRange() {
 // === SEARCH & FILTER ===
 function setStatusFilter(status) {
     document.getElementById('statusHidden').value = status;
-    // Reset to page 1 when changing filter
     document.getElementById('searchForm').submit();
 }
 
-// Allow Enter key in search box
 document.getElementById('searchInput').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') { e.preventDefault(); document.getElementById('searchForm').submit(); }
 });
@@ -387,8 +384,8 @@ function syncSage() {
         .then(function(r) { return r.json(); })
         .then(function(data) {
             if (data.ok) { toast('Synced ' + data.synced + ' invoices (' + data.new + ' new)', 'success'); setTimeout(function(){ window.location.href = '/?date_from=' + df + '&date_to=' + dt; }, 800); }
-            else { toast('Sync failed: ' + data.error, 'error'); btn.disabled = false; btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Sync Date Range'; }
-        }).catch(function(e) { toast('Error: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Sync Date Range'; });
+            else { toast('Sync failed: ' + data.error, 'error'); btn.disabled = false; btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Sync Now'; }
+        }).catch(function(e) { toast('Error: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Sync Now'; });
 }
 
 function postInvoice(trx, btnEl) {
@@ -512,14 +509,9 @@ function saveSettings() {
             else { toast('Failed to save', 'error'); }
         });
 }
-function fetchFlickCategories() {
-    var pre = document.getElementById('flickCatResult');
-    pre.style.display = 'block'; pre.textContent = 'Fetching from Flick API...';
-    fetch('/api/reference-tax-categories').then(function(r) { return r.json(); }).then(function(data) { pre.textContent = JSON.stringify(data, null, 2); }).catch(function(e) { pre.textContent = 'Error: ' + e.message; });
-}
 document.getElementById('settingsModal').addEventListener('click', function(e) { if (e.target === this) closeSettings(); });
 
-// Silent background sync — no spinner, just reloads if new invoices found
+// Silent background sync
 function bgSync() {
     var df = document.getElementById('dateFrom').value;
     var dt = document.getElementById('dateTo').value;
@@ -551,7 +543,6 @@ window.addEventListener('load', function() {
             } else { banner.className = 'sync-banner error'; txt.textContent = 'Sync failed: ' + (data.error||''); }
         }).catch(function(e) { sp.style.display = 'none'; banner.className = 'sync-banner error'; txt.textContent = 'Sync error: ' + e.message; });
 
-    // Auto-sync every 10 minutes in the background
     setInterval(bgSync, 10 * 60 * 1000);
 });
 </script>

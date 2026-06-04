@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Genesis E-Invoicing</title>
+    <style>
+        :root {
+            --navy: #0f172a; --blue: #2563eb; --green: #16a34a; --red: #dc2626;
+            --slate50: #f8fafc; --slate200: #e2e8f0; --slate400: #94a3b8;
+            --slate500: #64748b; --slate800: #1e293b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: var(--slate800);
+            min-height: 100vh;
+            display: flex; align-items: center; justify-content: center;
+            padding: 20px;
+        }
+        .login-card {
+            background: white; border-radius: 16px; padding: 40px;
+            width: 100%; max-width: 400px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .login-logo {
+            width: 56px; height: 56px; background: var(--green);
+            border-radius: 12px; display: flex; align-items: center;
+            justify-content: center; font-weight: 700; font-size: 20px;
+            color: white; margin: 0 auto 16px;
+        }
+        .login-title { font-size: 20px; font-weight: 700; text-align: center; margin-bottom: 4px; }
+        .login-subtitle { font-size: 13px; color: var(--slate500); text-align: center; margin-bottom: 28px; }
+        label { display: block; font-size: 12px; font-weight: 600; color: var(--slate500);
+                text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+        input[type="password"], input[type="text"] {
+            width: 100%; padding: 12px 14px; border: 1px solid var(--slate200);
+            border-radius: 8px; font-size: 15px; outline: none; transition: border-color 0.15s;
+        }
+        input[type="password"]:focus, input[type="text"]:focus {
+            border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
+        }
+        .btn-login {
+            width: 100%; margin-top: 20px; padding: 12px; background: var(--blue);
+            color: white; border: none; border-radius: 8px; font-size: 15px;
+            font-weight: 600; cursor: pointer; transition: opacity 0.15s;
+        }
+        .btn-login:hover { opacity: 0.92; }
+        .error-box {
+            background: #fee2e2; color: #991b1b; border: 1px solid #fecaca;
+            border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 18px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .login-footer { margin-top: 24px; text-align: center; font-size: 11px; color: var(--slate400); }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="login-logo">G</div>
+        <div class="login-title">E-Invoicing Dashboard</div>
+        <div class="login-subtitle">Genesis Group &middot; Nigeria FIRS</div>
+
+        {% if error %}
+        <div class="error-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <span>{{ error }}</span>
+        </div>
+        {% endif %}
+
+        <form method="POST" action="{{ url_for('login') }}">
+            <label for="password">Password</label>
+            <input
+                type="password"
+                id="password"
+                name="password"
+                placeholder="Enter your company password"
+                autocomplete="current-password"
+                autofocus
+                required
+            >
+            <button type="submit" class="btn-login">Sign In</button>
+        </form>
+
+        <div class="login-footer">
+            Authorized personnel only. Each login is scoped to a single entity.
+        </div>
+    </div>
+</body>
+</html>
