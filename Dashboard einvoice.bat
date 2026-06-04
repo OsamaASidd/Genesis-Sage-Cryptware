@@ -1,18 +1,16 @@
 @echo off
-title Nigeria E-Invoicing Dashboard
+title Nigeria E-Invoicing Dashboard - Genesis Food
 color 0A
 
 echo.
 echo  ========================================
 echo   Nigeria E-Invoicing Dashboard
-echo   Proton Security Services Ltd
+echo   Genesis Food Nigeria Limited
 echo  ========================================
 echo.
 
-:: Change to the folder where this script lives
 cd /d "%~dp0"
 
-:: Check if Python is available
 python --version >nul 2>&1
 if errorlevel 1 (
     echo  [ERROR] Python not found in PATH.
@@ -21,19 +19,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Install dependencies if needed
-echo  Checking dependencies...
-pip install flask pyodbc requests reportlab qrcode Pillow --quiet
+if exist venv\Scripts\activate.bat (
+    echo  Activating virtual environment...
+    call venv\Scripts\activate.bat
+) else (
+    echo  [WARN] No venv found - installing to system Python...
+    pip install flask pyodbc requests reportlab qrcode Pillow --quiet
+)
 
 echo.
-echo  Starting server at http://localhost:5000
+echo  Starting Genesis Food dashboard at http://[public-ip]:5002
 echo  Press Ctrl+C to stop.
 echo.
 
-:: Open browser after a short delay (runs in background)
-start "" cmd /c "timeout /t 2 >nul && start http://localhost:5000"
+for /f "delims=" %%I in ('powershell -NoProfile -Command "(Invoke-WebRequest -Uri https://api.ipify.org -UseBasicParsing).Content.Trim()"') do set PUBLIC_IP=%%I
+start "" cmd /c "timeout /t 3 >nul && start http://%PUBLIC_IP%:5002"
 
-:: Start Flask
-python app.py
+python genesis_app.py
 
 pause

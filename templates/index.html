@@ -107,18 +107,17 @@
         <div class="header-logo">PS</div>
         <div>
             <div class="header-title">E-Invoicing Dashboard</div>
-            <div class="header-subtitle">Proton Security Services Ltd</div>
         </div>
     </div>
     <div class="header-right" style="display:flex;align-items:center;gap:8px">
         <button class="btn-ghost" onclick="openSettings()" title="Tax Category Settings" style="font-size:18px;padding:4px 8px">&#9881;</button>
-        <span class="header-env">PROD</span>
+        <span class="header-env">PRE-PROD</span>
     </div>
 </header>
 
 <div class="sync-banner" id="syncBanner" style="display:none">
     <span class="spinner spinner-dark" id="syncSpinner"></span>
-    <span id="syncBannerText">Syncing invoices from Sage 50...</span>
+    <span id="syncBannerText">Syncing invoices from Sage Evolution...</span>
 </div>
 
 <!-- Stats (clickable to filter by status) -->
@@ -253,7 +252,7 @@
             {% if q or status_filter %}
                 No invoices match your search. <a href="/" style="color:var(--blue)">Clear filters</a>
             {% else %}
-                No invoices found. Click "Sync Date Range" to load from Sage 50.
+                No invoices found. Click "Sync Date Range" to load from Sage Evolution.
             {% endif %}
         </td></tr>
         {% endif %}
@@ -424,7 +423,7 @@ function previewPayload(trx) {
     var modal = document.getElementById('previewModal');
     var pre = document.getElementById('previewJson');
     var info = document.getElementById('previewInfo');
-    pre.textContent = 'Loading... (fetching line items from Sage 50)';
+    pre.textContent = 'Loading... (fetching line items from Sage Evolution)';
     info.style.display = 'none';
     document.getElementById('previewSubtitle').textContent = 'TRX ' + trx;
     modal.classList.add('active');

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\E-Invoicing\\\\Sage-Nigeria-E-Invoicing\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(head -150)",
+      "Bash(Remove-Item -Path \"c:\\\\E-Invoicing\\\\Sage-Nigeria-E-Invoicing\\\\einvoice_innoson.db\" -ErrorAction SilentlyContinue)",
+      "Bash(Write-Output \"Deleted \\(or did not exist\\)\")",
+      "PowerShell(\\(Invoke-WebRequest -Uri \"https://api.ipify.org\" -UseBasicParsing\\).Content)"
+    ]
+  }
+}
