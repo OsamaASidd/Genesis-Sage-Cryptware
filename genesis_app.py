@@ -1,15 +1,14 @@
 """
 Genesis Group - E-Invoicing Dashboard (multi-entity with login)
 ================================================================
-Syncs from Sage Evolution SQL Server (dbo.InvNum, dbo.Client, _btblInvoiceLines)
-DocType 0 = Tax Invoice | DocType 1 = Credit Note
+Each company is a SEPARATE Sage database. The logged-in entity decides
+which database to connect to and which API key to post with.
 
 Login:
-  "Food 123"   -> Genesis Food Nigeria Limited
-  "Cenima 456" -> Genesis Deluxe Cinemas Limited
+  "Food 123"   -> Genesis Food Nigeria Limited   (DB: GGNL-LIVE)
+  "Cenima 456" -> Genesis Deluxe Cinemas Limited (DB: set in config.py)
 
-Each logged-in user only sees and posts invoices for their own entity, using
-that entity's API key. Rows are isolated per entity via the `entity` column.
+Invoices are isolated per entity via the `entity` column in SQLite.
 """
 
 import os, io, re, sqlite3, threading, functools, pyodbc, requests
@@ -22,9 +21,7 @@ from flask import (
 
 from config import (
     SECRET_KEY,
-    GENESIS_DB_CONN_STR,
     GENESIS_DOCTYPE_INVOICE, GENESIS_DOCTYPE_CREDIT_NOTE,
-    ENTITY_FILTER_COLUMN,
     LOGIN_USERS, ENTITY_LABELS, get_entity,
 )
 
@@ -42,7 +39,7 @@ app.secret_key = SECRET_KEY
 _db_lock  = threading.Lock()
 
 
-# ─── ENTITY RESOLUTION (per request) ───────────────────────────────────────────
+# --- ENTITY RESOLUTION (per request) -------------------------------------------
 
 def current_entity_key():
     return session.get("entity_key")
@@ -50,6 +47,10 @@ def current_entity_key():
 def current_entity():
     """Return the active entity config dict for the logged-in session."""
     return get_entity(session.get("entity_key"))
+
+def entity_conn_str(entity):
+    """The Sage SQL Server connection string for this entity's company DB."""
+    return entity["db_conn_str"]
 
 def entity_api(entity):
     """Build API url + headers for a given entity dict."""
@@ -72,13 +73,32 @@ def entity_supplier(entity):
     }
 
 
-# ─── AUTH ───────────────────────────────────────────────────────────────────
+def entity_branch_filter(entity):
+    """
+    Return (sql_fragment, params) that restricts dbo.InvNum to this entity's
+    branches. Driven by config: branch_include (whitelist) or branch_exclude
+    (blacklist) on branch_column. Returns ("", []) if no filter configured.
+    """
+    col = entity.get("branch_column")
+    if not col:
+        return "", []
+    inc = entity.get("branch_include")
+    exc = entity.get("branch_exclude")
+    if inc:
+        ph = ",".join("?" * len(inc))
+        return f" AND [{col}] IN ({ph})", list(inc)
+    if exc:
+        ph = ",".join("?" * len(exc))
+        return f" AND [{col}] NOT IN ({ph})", list(exc)
+    return "", []
+
+
+# --- AUTH ----------------------------------------------------------------------
 
 def login_required(view):
     @functools.wraps(view)
     def wrapped(*args, **kwargs):
         if not current_entity():
-            # API calls get JSON 401; page navigations get redirected.
             if request.path.startswith("/api/"):
                 return jsonify({"ok": False, "error": "Not authenticated"}), 401
             return redirect(url_for("login"))
@@ -86,7 +106,7 @@ def login_required(view):
     return wrapped
 
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+# --- HELPERS -------------------------------------------------------------------
 
 def to_float(val):
     if val is None: return 0.0
@@ -114,7 +134,7 @@ def to_e164(phone):
     return f'+{p}'
 
 
-# ─── SQLITE ───────────────────────────────────────────────────────────────────
+# --- SQLITE --------------------------------------------------------------------
 
 def _open_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -156,7 +176,8 @@ def init_db():
         conn = _open_db()
         try:
             conn.execute("""CREATE TABLE IF NOT EXISTS invoices (
-                post_order INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_order INTEGER,
                 entity TEXT,
                 trx_number INTEGER,
                 invoice_num TEXT, customer_name TEXT, customer_id TEXT,
@@ -168,10 +189,13 @@ def init_db():
                 error_message TEXT, api_response TEXT,
                 invoice_description TEXT,
                 invoice_type TEXT DEFAULT 'Invoice',
-                last_synced TEXT)""")
+                cancel_ref TEXT,
+                last_synced TEXT,
+                UNIQUE(entity, post_order))""")
 
             conn.execute("""CREATE TABLE IF NOT EXISTS invoice_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity TEXT,
                 post_order INTEGER,
                 trx_number INTEGER,
                 line_num INTEGER, item_code TEXT, description TEXT,
@@ -181,14 +205,6 @@ def init_db():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_status   ON invoices(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_customer ON invoices(customer_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_entity   ON invoices(entity)")
-            for col_sql in (
-                "ALTER TABLE invoices ADD COLUMN cancel_ref TEXT",
-                "ALTER TABLE invoices ADD COLUMN entity TEXT",
-            ):
-                try:
-                    conn.execute(col_sql)
-                except Exception:
-                    pass
             conn.commit()
         finally:
             conn.close()
@@ -196,7 +212,7 @@ def init_db():
 init_db()
 
 
-# ─── CLIENT MAP ───────────────────────────────────────────────────────────────
+# --- CLIENT MAP ----------------------------------------------------------------
 
 def _build_client_map(cursor):
     """Read dbo.Client with dynamic column discovery. Returns {AccountID: {...}}."""
@@ -249,7 +265,7 @@ def _build_client_map(cursor):
     return client_map
 
 
-# ─── SAGE EVOLUTION SYNC ──────────────────────────────────────────────────────
+# --- SAGE EVOLUTION SYNC -------------------------------------------------------
 
 def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
     if not date_from:
@@ -257,14 +273,11 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
     if not date_to:
         date_to = date.today().strftime("%Y-%m-%d")
 
-    # Entity separation filter. Only applied if you've configured both
-    # ENTITY_FILTER_COLUMN (config) and this entity's filter_value.
-    filter_col   = ENTITY_FILTER_COLUMN
-    filter_value = entity.get("filter_value", "")
-    use_filter   = bool(filter_col and filter_value)
+    conn_str = entity_conn_str(entity)
+    branch_sql, branch_params = entity_branch_filter(entity)
 
     try:
-        sage = pyodbc.connect(GENESIS_DB_CONN_STR, timeout=15)
+        sage = pyodbc.connect(conn_str, timeout=15)
     except Exception as e:
         return {"ok": False, "error": f"DB connection: {e}"}
 
@@ -276,10 +289,8 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                        InvDate, InvTotExcl, InvTotTax, InvTotIncl,
                        Description, DocType,
                        Address1, Address2, Address3,
-                       cTaxNumber, cTelephone, cEmail"""
-
-        extra_filter = f" AND [{filter_col}] = ?" if use_filter else ""
-        params_tail  = [filter_value] if use_filter else []
+                       cTaxNumber, cTelephone, cEmail,
+                       InvNum_iBranchID"""
 
         try:
             sql = f"""
@@ -287,11 +298,11 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 FROM dbo.InvNum
                 WHERE DocType IN (?, ?)
                   AND InvDate >= ? AND InvDate < DATEADD(day, 1, CAST(? AS date))
-                  {extra_filter}
+                  {branch_sql}
                 ORDER BY InvDate DESC
             """
             cursor.execute(sql, [GENESIS_DOCTYPE_INVOICE, GENESIS_DOCTYPE_CREDIT_NOTE,
-                                 date_from, date_to] + params_tail)
+                                 date_from, date_to] + branch_params)
             has_link_col = True
         except Exception:
             sql = f"""
@@ -299,20 +310,24 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 FROM dbo.InvNum
                 WHERE DocType IN (?, ?)
                   AND InvDate >= ? AND InvDate < DATEADD(day, 1, CAST(? AS date))
-                  {extra_filter}
+                  {branch_sql}
                 ORDER BY InvDate DESC
             """
             cursor.execute(sql, [GENESIS_DOCTYPE_INVOICE, GENESIS_DOCTYPE_CREDIT_NOTE,
-                                 date_from, date_to] + params_tail)
+                                 date_from, date_to] + branch_params)
             has_link_col = False
         headers = cursor.fetchall()
-        print(f"[SYNC:{entity_key}] {len(headers)} rows for {date_from} → {date_to} "
-              f"(filter={'on' if use_filter else 'OFF'}, iLinkNum={'yes' if has_link_col else 'no'})")
+        print(f"[SYNC:{entity_key}] {len(headers)} rows for {date_from} -> {date_to} "
+              f"(branch_filter='{branch_sql.strip()}' {branch_params}, "
+              f"iLinkNum={'yes' if has_link_col else 'no'})")
 
+        # Column layout: 0..15 base fields, 16 = InvNum_iBranchID, 17 = iLinkNum (if present)
+        BRANCH_IDX = 16
+        LINK_IDX   = 17
         link_ids = set()
         for hdr in headers:
-            if hdr[9] == GENESIS_DOCTYPE_CREDIT_NOTE and has_link_col and len(hdr) > 16 and hdr[16]:
-                link_ids.add(int(hdr[16]))
+            if hdr[9] == GENESIS_DOCTYPE_CREDIT_NOTE and has_link_col and len(hdr) > LINK_IDX and hdr[LINK_IDX]:
+                link_ids.add(int(hdr[LINK_IDX]))
         link_map = {}
         if link_ids:
             placeholders = ",".join("?" * len(link_ids))
@@ -350,8 +365,19 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
         cust_tin_raw   = to_str(hdr[13]) if len(hdr) > 13 else ""
         cust_tel_raw   = to_str(hdr[14]) if len(hdr) > 14 else ""
         cust_email_raw = to_str(hdr[15]) if len(hdr) > 15 else ""
-        link_num = hdr[16] if has_link_col and len(hdr) > 16 else None
+        link_num = hdr[LINK_IDX] if has_link_col and len(hdr) > LINK_IDX else None
         cancel_ref = link_map.get(int(link_num), "") if link_num else ""
+
+        # --- STRICT BRANCH GUARD ---------------------------------------------
+        # Even though the SQL already filtered by branch, re-verify every row in
+        # Python so this entity can NEVER store another company's invoice.
+        row_branch = hdr[BRANCH_IDX]
+        inc = entity.get("branch_include")
+        exc = entity.get("branch_exclude")
+        if inc is not None and row_branch not in inc:
+            continue
+        if exc is not None and row_branch in exc:
+            continue
 
         inv_date_str = (
             inv_date.strftime("%Y-%m-%d") if isinstance(inv_date, (datetime, date))
@@ -402,15 +428,15 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
         "new":       new_count,
         "date_from": date_from,
         "date_to":   date_to,
-        "filtered":  use_filter,
     }
 
 
-# ─── FETCH LINE ITEMS ─────────────────────────────────────────────────────────
+# --- FETCH LINE ITEMS ----------------------------------------------------------
 
-def fetch_line_items(auto_index):
+def fetch_line_items(entity, auto_index):
+    conn_str = entity_conn_str(entity)
     try:
-        sage = pyodbc.connect(GENESIS_DB_CONN_STR, timeout=15)
+        sage = pyodbc.connect(conn_str, timeout=15)
     except Exception as e:
         return [], 0, f"DB: {e}"
 
@@ -463,7 +489,7 @@ def fetch_line_items(auto_index):
             item_info = item_lookup.get(stock_id, {})
             item_code = item_info.get("code", "") or (str(stock_id) if stock_id else "")
             if not line_desc:
-                line_desc = item_info.get("desc", "") or item_code or "Food / Catering"
+                line_desc = item_info.get("desc", "") or item_code or "Item"
 
             if unit_price == 0 and qty and excl_amt:
                 unit_price = abs(excl_amt / qty)
@@ -484,14 +510,14 @@ def fetch_line_items(auto_index):
             if excl_amt != 0 or unit_price != 0:
                 lines.append({
                     "item_code":   item_code or "ITEM",
-                    "description": line_desc or "Food / Catering",
+                    "description": line_desc or "Item",
                     "quantity":    abs(qty) if qty else 1,
                     "unit_price":  abs(unit_price),
                     "amount":      abs(excl_amt) if excl_amt else abs(unit_price),
                     "tax_rate":    tax_rate,
                 })
 
-        print(f"[LINES] AutoIndex={auto_index} → {len(lines)} lines, VAT={vat_amount}")
+        print(f"[LINES] AutoIndex={auto_index} -> {len(lines)} lines, VAT={vat_amount}")
         return lines, vat_amount, None
 
     except Exception as e:
@@ -500,7 +526,7 @@ def fetch_line_items(auto_index):
         sage.close()
 
 
-# ─── BUILD PAYLOAD ────────────────────────────────────────────────────────────
+# --- BUILD PAYLOAD -------------------------------------------------------------
 
 def build_payload(auto_index, entity_key, entity):
     inv = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
@@ -511,7 +537,7 @@ def build_payload(auto_index, entity_key, entity):
     product_cat  = entity["product_category"]
     default_city = entity["supplier"]["postal_address"].get("city_name", "Port Harcourt")
 
-    lines, vat_amount, line_error = fetch_line_items(inv["post_order"])
+    lines, vat_amount, line_error = fetch_line_items(entity, inv["post_order"])
 
     if not lines:
         amt = abs(to_float(inv["amount"]))
@@ -610,7 +636,7 @@ def build_payload(auto_index, entity_key, entity):
     return payload, lines, vat_amount, None
 
 
-# ─── POST TO FIRS ─────────────────────────────────────────────────────────────
+# --- POST TO FIRS --------------------------------------------------------------
 
 def post_to_firs(auto_index, entity_key, entity):
     inv = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
@@ -628,15 +654,15 @@ def post_to_firs(auto_index, entity_key, entity):
         return {"ok": False, "error": build_error}
 
     ops = [
-        ("DELETE FROM invoice_lines WHERE post_order=?", (auto_index,)),
+        ("DELETE FROM invoice_lines WHERE post_order=? AND entity=?", (auto_index, entity_key)),
         ("UPDATE invoices SET vat_amount=? WHERE post_order=? AND entity=?", (vat_amount, auto_index, entity_key)),
     ]
     for i, line in enumerate(lines):
         ops.append((
             "INSERT INTO invoice_lines "
-            "(post_order,trx_number,line_num,item_code,description,quantity,unit_price,amount,tax_rate) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (auto_index, auto_index, i+1, line["item_code"], line["description"],
+            "(entity,post_order,trx_number,line_num,item_code,description,quantity,unit_price,amount,tax_rate) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (entity_key, auto_index, auto_index, i+1, line["item_code"], line["description"],
              line["quantity"], line["unit_price"], line["amount"], line.get("tax_rate", 0)),
         ))
     db_write_many(ops)
@@ -697,7 +723,7 @@ def post_to_firs(auto_index, entity_key, entity):
         return {"ok": False, "error": str(e)}
 
 
-# ─── PDF GENERATION ───────────────────────────────────────────────────────────
+# --- PDF GENERATION ------------------------------------------------------------
 
 def generate_pdf(auto_index, entity_key, entity):
     from reportlab.lib.pagesizes import A4
@@ -709,7 +735,8 @@ def generate_pdf(auto_index, entity_key, entity):
     supplier = entity_supplier(entity)
 
     inv   = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
-    lines = db_read("SELECT * FROM invoice_lines WHERE post_order=? ORDER BY line_num", (auto_index,))
+    lines = db_read("SELECT * FROM invoice_lines WHERE post_order=? AND entity=? ORDER BY line_num",
+                    (auto_index, entity_key))
     if not inv:
         return None
 
@@ -854,11 +881,10 @@ def generate_pdf(auto_index, entity_key, entity):
     return pdf_path
 
 
-# ─── AUTH ROUTES ───────────────────────────────────────────────────────────────
+# --- AUTH ROUTES ---------------------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    # Already logged in -> go to dashboard.
     if current_entity() and request.method == "GET":
         return redirect(url_for("index"))
 
@@ -879,7 +905,7 @@ def logout():
     return redirect(url_for("login"))
 
 
-# ─── ROUTES ───────────────────────────────────────────────────────────────────
+# --- ROUTES --------------------------------------------------------------------
 
 @app.route("/")
 @login_required
@@ -1047,8 +1073,9 @@ def api_stats():
 @login_required
 def api_debug_lines(auto_index):
     entity_key       = current_entity_key()
+    entity           = current_entity()
     inv              = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
-    lines, vat, err  = fetch_line_items(auto_index)
+    lines, vat, err  = fetch_line_items(entity, auto_index)
     subtotal         = sum(l["amount"] for l in lines)
     return jsonify({
         "post_order":  auto_index,
@@ -1063,8 +1090,9 @@ def api_debug_lines(auto_index):
 @login_required
 def api_debug_schema():
     """Lists all tables + probes invoice-related ones for column names."""
+    entity = current_entity()
     try:
-        sage   = pyodbc.connect(GENESIS_DB_CONN_STR, timeout=10)
+        sage   = pyodbc.connect(entity_conn_str(entity), timeout=10)
         cursor = sage.cursor()
 
         cursor.execute("""
@@ -1112,9 +1140,10 @@ def api_debug_schema():
 @app.route("/api/debug-sage")
 @login_required
 def api_debug_sage():
-    """Shows what's actually in dbo.InvNum — use this to verify the sync query."""
+    """Shows what's actually in dbo.InvNum for the current entity's DB."""
+    entity = current_entity()
     try:
-        sage   = pyodbc.connect(GENESIS_DB_CONN_STR, timeout=10)
+        sage   = pyodbc.connect(entity_conn_str(entity), timeout=10)
         cursor = sage.cursor()
 
         cursor.execute("""
@@ -1141,24 +1170,12 @@ def api_debug_sage():
             for r in cursor.fetchall()
         ]
 
-        cursor.execute("""
-            SELECT TOP 5 AutoIndex, InvNumber, cAccountName, InvDate,
-                         InvTotExcl, InvTotTax, DocType
-            FROM dbo.InvNum WHERE DocType = 1 ORDER BY InvDate DESC
-        """)
-        cn_samples = [
-            {"AutoIndex": r[0], "InvNumber": r[1], "Customer": r[2],
-             "Date": str(r[3])[:10], "Excl": float(r[4] or 0), "Tax": float(r[5] or 0)}
-            for r in cursor.fetchall()
-        ]
-
         sage.close()
         return jsonify({
             "ok": True,
             "doctype_summary": doctype_summary,
             "invoice_samples (DocType 0)": inv_samples,
-            "credit_note_samples (DocType 1)": cn_samples,
-            "note": "DocType 0=Invoice, 1=Credit Note. Check 'earliest'/'latest' dates match your sync range.",
+            "note": "DocType 0=Invoice, 1=Credit Note.",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
