@@ -5,8 +5,8 @@ Each company is a SEPARATE Sage database. The logged-in entity decides
 which database to connect to and which API key to post with.
 
 Login:
-  "Food 123"   -> Genesis Food Nigeria Limited   (DB: GGNL-LIVE)
-  "Cenima 456" -> Genesis Deluxe Cinemas Limited (DB: set in config.py)
+  "new123"  -> Genesis Food Nigeria Limited   (branches 1,5,6,9)
+  "new321"  -> Genesis Deluxe Cinemas Limited (branch 12)
 
 Invoices are isolated per entity via the `entity` column in SQLite.
 """
@@ -268,13 +268,50 @@ def _build_client_map(cursor):
 # --- SAGE EVOLUTION SYNC -------------------------------------------------------
 
 def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
+    """
+    Sync SALES from dbo.PostAR (the AR ledger), NOT dbo.InvNum.
+
+    Genesis raises sales as AR transactions, not InvNum tax-invoice documents.
+    A sale in PostAR is identified by:
+        Id = 'ARTx'                         (an AR transaction, not a cashbook receipt)
+        Debit > 0                           (customer is charged - the sale side)
+        Description LIKE '%sales invoice%'   (real sale, not 'PMT FOR' / 'PURCHASE OF')
+        iTxBranchID in this entity's branches
+        TrCodeID in this entity's sales code list (config: sales_trcodes)
+
+    PostAR has NO line items, so each sale becomes a single summary line.
+    PostAR's Debit is treated as the TAX-INCLUSIVE (gross) total. VAT is derived
+    from it using the entity's vat_rate (TaxTypeID 7 = 7.5% in Nigeria), unless
+    AMOUNT_IS_TAX_INCLUSIVE is set False (then VAT is added on top).
+    """
     if not date_from:
         date_from = "2020-01-01"
     if not date_to:
         date_to = date.today().strftime("%Y-%m-%d")
 
     conn_str = entity_conn_str(entity)
-    branch_sql, branch_params = entity_branch_filter(entity)
+
+    # Branch filter against PostAR's branch column (iTxBranchID).
+    branch_col = entity.get("postar_branch_column", "iTxBranchID")
+    inc = entity.get("branch_include")
+    exc = entity.get("branch_exclude")
+    if inc:
+        branch_sql    = f" AND [{branch_col}] IN ({','.join('?'*len(inc))})"
+        branch_params = list(inc)
+    elif exc:
+        branch_sql    = f" AND [{branch_col}] NOT IN ({','.join('?'*len(exc))})"
+        branch_params = list(exc)
+    else:
+        branch_sql, branch_params = "", []
+
+    # Sales transaction-code whitelist (e.g. 159 = sales invoice). If empty, the
+    # Description LIKE filter alone identifies sales.
+    sales_trcodes = entity.get("sales_trcodes") or []
+    trcode_sql    = ""
+    trcode_params = []
+    if sales_trcodes:
+        trcode_sql    = f" AND ar.[TrCodeID] IN ({','.join('?'*len(sales_trcodes))})"
+        trcode_params = list(sales_trcodes)
 
     try:
         sage = pyodbc.connect(conn_str, timeout=15)
@@ -285,115 +322,90 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
         cursor     = sage.cursor()
         client_map = _build_client_map(cursor)
 
-        base_cols = """AutoIndex, InvNumber, AccountID, cAccountName,
-                       InvDate, InvTotExcl, InvTotTax, InvTotIncl,
-                       Description, DocType,
-                       Address1, Address2, Address3,
-                       cTaxNumber, cTelephone, cEmail,
-                       InvNum_iBranchID"""
-
-        try:
-            sql = f"""
-                SELECT {base_cols}, iLinkNum
-                FROM dbo.InvNum
-                WHERE DocType IN (?, ?)
-                  AND InvDate >= ? AND InvDate < DATEADD(day, 1, CAST(? AS date))
-                  {branch_sql}
-                ORDER BY InvDate DESC
-            """
-            cursor.execute(sql, [GENESIS_DOCTYPE_INVOICE, GENESIS_DOCTYPE_CREDIT_NOTE,
-                                 date_from, date_to] + branch_params)
-            has_link_col = True
-        except Exception:
-            sql = f"""
-                SELECT {base_cols}
-                FROM dbo.InvNum
-                WHERE DocType IN (?, ?)
-                  AND InvDate >= ? AND InvDate < DATEADD(day, 1, CAST(? AS date))
-                  {branch_sql}
-                ORDER BY InvDate DESC
-            """
-            cursor.execute(sql, [GENESIS_DOCTYPE_INVOICE, GENESIS_DOCTYPE_CREDIT_NOTE,
-                                 date_from, date_to] + branch_params)
-            has_link_col = False
-        headers = cursor.fetchall()
-        print(f"[SYNC:{entity_key}] {len(headers)} rows for {date_from} -> {date_to} "
-              f"(branch_filter='{branch_sql.strip()}' {branch_params}, "
-              f"iLinkNum={'yes' if has_link_col else 'no'})")
-
-        # Column layout: 0..15 base fields, 16 = InvNum_iBranchID, 17 = iLinkNum (if present)
-        BRANCH_IDX = 16
-        LINK_IDX   = 17
-        link_ids = set()
-        for hdr in headers:
-            if hdr[9] == GENESIS_DOCTYPE_CREDIT_NOTE and has_link_col and len(hdr) > LINK_IDX and hdr[LINK_IDX]:
-                link_ids.add(int(hdr[LINK_IDX]))
-        link_map = {}
-        if link_ids:
-            placeholders = ",".join("?" * len(link_ids))
-            cursor.execute(f"SELECT AutoIndex, InvNumber FROM dbo.InvNum WHERE AutoIndex IN ({placeholders})",
-                           list(link_ids))
-            for r in cursor.fetchall():
-                link_map[r[0]] = to_str(r[1])
-
+        # PostAR columns. AccountLink -> dbo.Client PK (same key the client_map uses).
+        sql = f"""
+            SELECT ar.[AutoIdx], ar.[TxDate], ar.[AccountLink], ar.[TrCodeID],
+                   ar.[Reference], ar.[cReference2], ar.[Description],
+                   ar.[Debit], ar.[Credit], ar.[Tax_Amount], ar.[{branch_col}] AS BranchID
+            FROM dbo.PostAR ar
+            WHERE ar.[Id] = 'ARTx'
+              AND ar.[Debit] > 0
+              AND ar.[Description] LIKE '%sales invoice%'
+              AND ar.[TxDate] >= ? AND ar.[TxDate] < DATEADD(day, 1, CAST(? AS date))
+              {branch_sql}
+              {trcode_sql}
+            ORDER BY ar.[TxDate] DESC
+        """
+        cursor.execute(sql, [date_from, date_to] + branch_params + trcode_params)
+        rows = cursor.fetchall()
+        print(f"[SYNC:{entity_key}] PostAR sales rows={len(rows)} for {date_from} -> {date_to} "
+              f"(branch='{branch_sql.strip()}' {branch_params}, trcodes={sales_trcodes})")
     except Exception as e:
         sage.close()
         return {"ok": False, "error": str(e)}
     finally:
         sage.close()
 
-    # Only consider this entity's existing rows.
+    # VAT handling
+    vat_rate     = float(entity.get("vat_rate", 7.5))
+    tax_inclusive = bool(entity.get("amount_is_tax_inclusive", True))
+
+    # Column indices for the PostAR SELECT above:
+    # 0 AutoIdx | 1 TxDate | 2 AccountLink | 3 TrCodeID | 4 Reference
+    # 5 cReference2 | 6 Description | 7 Debit | 8 Credit | 9 Tax_Amount | 10 BranchID
+    BRANCH_IDX = 10
+
     existing  = {r["post_order"]: r["status"]
                  for r in db_read("SELECT post_order, status FROM invoices WHERE entity=?", (entity_key,))}
     now       = datetime.now().isoformat()
     ops       = []
     new_count = 0
 
-    for hdr in headers:
-        auto_idx = hdr[0]
-        inv_num  = to_str(hdr[1])
-        acct_id  = hdr[2]
-        acct_nm  = to_str(hdr[3])
-        inv_date = hdr[4]
-        excl     = to_float(hdr[5])
-        tax      = to_float(hdr[6])
-        desc     = to_str(hdr[8])
-        doc_type = hdr[9]
-        addr1    = to_str(hdr[10]) if len(hdr) > 10 else ""
-        addr2    = to_str(hdr[11]) if len(hdr) > 11 else ""
-        addr3    = to_str(hdr[12]) if len(hdr) > 12 else ""
-        cust_tin_raw   = to_str(hdr[13]) if len(hdr) > 13 else ""
-        cust_tel_raw   = to_str(hdr[14]) if len(hdr) > 14 else ""
-        cust_email_raw = to_str(hdr[15]) if len(hdr) > 15 else ""
-        link_num = hdr[LINK_IDX] if has_link_col and len(hdr) > LINK_IDX else None
-        cancel_ref = link_map.get(int(link_num), "") if link_num else ""
+    for row in rows:
+        auto_idx   = row[0]                       # PostAR.AutoIdx = unique key per ledger row
+        tx_date    = row[1]
+        acct_link  = row[2]
+        ref        = to_str(row[4])               # e.g. SGIR/02/JAN/2026 -> invoice number
+        cref2      = to_str(row[5])               # e.g. ICARBR1651
+        desc       = to_str(row[6])               # 'JAN26 sales invoice-SAHARA'
+        debit      = to_float(row[7])
+        row_tax    = to_float(row[9])
 
-        # --- STRICT BRANCH GUARD ---------------------------------------------
-        # Even though the SQL already filtered by branch, re-verify every row in
-        # Python so this entity can NEVER store another company's invoice.
-        row_branch = hdr[BRANCH_IDX]
-        inc = entity.get("branch_include")
-        exc = entity.get("branch_exclude")
+        # --- STRICT BRANCH GUARD (defence in depth) --------------------------
+        row_branch = row[BRANCH_IDX]
         if inc is not None and row_branch not in inc:
             continue
         if exc is not None and row_branch in exc:
             continue
 
+        # --- AMOUNT & VAT ----------------------------------------------------
+        # PostAR rows carry the full charge in Debit; Tax_Amount is usually 0
+        # (the GL tax line is posted separately), so derive VAT from the gross.
+        if row_tax and row_tax > 0:
+            tax  = row_tax
+            excl = debit - tax if tax_inclusive else debit
+        elif tax_inclusive:
+            excl = round(debit / (1 + vat_rate / 100.0), 2)
+            tax  = round(debit - excl, 2)
+        else:
+            excl = debit
+            tax  = round(debit * (vat_rate / 100.0), 2)
+
         inv_date_str = (
-            inv_date.strftime("%Y-%m-%d") if isinstance(inv_date, (datetime, date))
-            else str(inv_date)[:10]
+            tx_date.strftime("%Y-%m-%d") if isinstance(tx_date, (datetime, date))
+            else str(tx_date)[:10]
         )
 
-        inv_type  = "Credit Note" if doc_type == GENESIS_DOCTYPE_CREDIT_NOTE else "Invoice"
-        cust      = client_map.get(acct_id, {})
-        cust_name = cust.get("name") or acct_nm or f"Account {acct_id}"
-        cust_id   = cust.get("id")   or to_str(acct_id)
+        inv_num = ref or cref2 or f"AR-{auto_idx}"
 
-        street = ", ".join(p for p in [addr1, addr2] if p) or cust.get("address", "")
-        city   = addr3 or cust.get("city", "")
-        tin    = cust_tin_raw   or cust.get("tin",   "")
-        phone  = cust_tel_raw   or cust.get("phone", "")
-        email  = cust_email_raw or cust.get("email", "")
+        cust      = client_map.get(acct_link, {})
+        cust_name = cust.get("name") or _name_from_desc(desc) or f"Account {acct_link}"
+        cust_id   = cust.get("id")   or to_str(acct_link)
+        street    = cust.get("address", "")
+        city      = cust.get("city", "")
+        tin       = cust.get("tin", "")
+        phone     = cust.get("phone", "")
+        email     = cust.get("email", "")
 
         if auto_idx in existing:
             if existing[auto_idx] != "posted":
@@ -404,7 +416,7 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                     "invoice_description=?,invoice_type=?,cancel_ref=?,last_synced=? "
                     "WHERE post_order=? AND entity=?",
                     (inv_num, cust_name, cust_id, tin, email, phone,
-                     street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now,
+                     street, city, inv_date_str, excl, tax, desc, "Invoice", "", now,
                      auto_idx, entity_key),
                 ))
         else:
@@ -416,7 +428,7 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 "invoice_date,amount,vat_amount,status,invoice_description,invoice_type,cancel_ref,last_synced) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (auto_idx, entity_key, auto_idx, inv_num, cust_name, cust_id, tin, email, phone,
-                 street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now),
+                 street, city, inv_date_str, excl, tax, desc, "Invoice", "", now),
             ))
 
     if ops:
@@ -424,106 +436,75 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
 
     return {
         "ok":        True,
-        "synced":    len(headers),
+        "synced":    len(rows),
         "new":       new_count,
         "date_from": date_from,
         "date_to":   date_to,
     }
 
 
+def _name_from_desc(desc):
+    """
+    Fallback customer name from a PostAR sales description like
+    'JAN26 sales invoice-SAHARA' -> 'SAHARA'. Used only when AccountLink
+    doesn't resolve in dbo.Client.
+    """
+    if not desc:
+        return ""
+    low = desc.lower()
+    marker = "sales invoice"
+    i = low.find(marker)
+    if i == -1:
+        return ""
+    tail = desc[i + len(marker):].lstrip(" -:").strip()
+    return tail or ""
+
+
 # --- FETCH LINE ITEMS ----------------------------------------------------------
 
-def fetch_line_items(entity, auto_index):
-    conn_str = entity_conn_str(entity)
-    try:
-        sage = pyodbc.connect(conn_str, timeout=15)
-    except Exception as e:
-        return [], 0, f"DB: {e}"
+def fetch_line_items(entity, auto_index, entity_key=None):
+    """
+    PostAR sales rows have NO line-item detail (no _btblInvoiceLines link), so
+    each invoice is represented by ONE summary line built from the values we
+    stored at sync time: amount (net/excl) + vat_amount.
 
-    try:
-        cursor = sage.cursor()
+    Reads the already-synced SQLite invoice row rather than Sage, because the
+    net/VAT split was computed during sync from PostAR.Debit.
+    """
+    if entity_key:
+        inv = db_read_one(
+            "SELECT post_order, invoice_num, invoice_description, amount, vat_amount "
+            "FROM invoices WHERE post_order=? AND entity=?",
+            (auto_index, entity_key),
+        )
+    else:
+        inv = db_read_one(
+            "SELECT post_order, invoice_num, invoice_description, amount, vat_amount "
+            "FROM invoices WHERE post_order=?",
+            (auto_index,),
+        )
 
-        LINES_TABLE = "_btblInvoiceLines"
+    if not inv:
+        return [], 0, "Invoice not found for line build"
 
-        item_lookup = {}
-        try:
-            cursor.execute(
-                "SELECT StockLink, Code, Description_1 FROM dbo.StkItem WHERE Code IS NOT NULL"
-            )
-            for r in cursor.fetchall():
-                item_lookup[r[0]] = {"code": to_str(r[1]), "desc": to_str(r[2])}
-        except Exception as e:
-            print(f"[WARN] StkItem lookup failed: {e}")
+    net = abs(to_float(inv.get("amount")))
+    vat = abs(to_float(inv.get("vat_amount")))
+    if net <= 0:
+        return [], 0, "Zero-amount invoice"
 
-        cursor.execute(f"""
-            SELECT
-                il.iLineID,
-                il.iStockCodeID,
-                il.cDescription,
-                il.fQuantity,
-                il.fUnitPriceExcl,
-                il.fQuantityLineTotExcl,
-                il.fQuantityLineTaxAmount,
-                il.fTaxRate,
-                il.iTaxTypeID
-            FROM dbo.[{LINES_TABLE}] il
-            WHERE il.iInvoiceID = ?
-            ORDER BY il.iLineID
-        """, (auto_index,))
+    tax_rate = round((vat / net) * 100, 2) if net and vat else 0.0
+    desc     = to_str(inv.get("invoice_description")) or to_str(inv.get("invoice_num")) or "Sales"
 
-        rows       = cursor.fetchall()
-        lines      = []
-        vat_amount = 0.0
-
-        for row in rows:
-            line_id    = row[0]
-            stock_id   = row[1]
-            line_desc  = to_str(row[2])
-            qty        = to_float(row[3])
-            unit_price = to_float(row[4])
-            excl_amt   = to_float(row[5])
-            line_tax   = to_float(row[6])
-            tax_rate_f = to_float(row[7])
-            tax_type   = row[8]
-
-            item_info = item_lookup.get(stock_id, {})
-            item_code = item_info.get("code", "") or (str(stock_id) if stock_id else "")
-            if not line_desc:
-                line_desc = item_info.get("desc", "") or item_code or "Item"
-
-            if unit_price == 0 and qty and excl_amt:
-                unit_price = abs(excl_amt / qty)
-            elif unit_price == 0:
-                unit_price = abs(excl_amt)
-
-            if tax_rate_f > 0:
-                tax_rate = tax_rate_f
-            elif line_tax > 0 and excl_amt:
-                tax_rate = round((line_tax / excl_amt) * 100, 2)
-            elif tax_type == 1:
-                tax_rate = 7.5
-            else:
-                tax_rate = 0.0
-
-            vat_amount += abs(line_tax)
-
-            if excl_amt != 0 or unit_price != 0:
-                lines.append({
-                    "item_code":   item_code or "ITEM",
-                    "description": line_desc or "Item",
-                    "quantity":    abs(qty) if qty else 1,
-                    "unit_price":  abs(unit_price),
-                    "amount":      abs(excl_amt) if excl_amt else abs(unit_price),
-                    "tax_rate":    tax_rate,
-                })
-
-        print(f"[LINES] AutoIndex={auto_index} -> {len(lines)} lines, VAT={vat_amount}")
-        return lines, vat_amount, None
-
-    except Exception as e:
-        return [], 0, str(e)
-    finally:
-        sage.close()
+    line = {
+        "item_code":   to_str(inv.get("invoice_num")) or f"AR-{auto_index}",
+        "description": desc,
+        "quantity":    1,
+        "unit_price":  net,
+        "amount":      net,
+        "tax_rate":    tax_rate,
+    }
+    print(f"[LINES] PostAR summary line for {auto_index}: net={net} vat={vat} rate={tax_rate}")
+    return [line], vat, None
 
 
 # --- BUILD PAYLOAD -------------------------------------------------------------
@@ -537,7 +518,7 @@ def build_payload(auto_index, entity_key, entity):
     product_cat  = entity["product_category"]
     default_city = entity["supplier"]["postal_address"].get("city_name", "Port Harcourt")
 
-    lines, vat_amount, line_error = fetch_line_items(entity, inv["post_order"])
+    lines, vat_amount, line_error = fetch_line_items(entity, inv["post_order"], entity_key)
 
     if not lines:
         amt = abs(to_float(inv["amount"]))
@@ -1075,7 +1056,7 @@ def api_debug_lines(auto_index):
     entity_key       = current_entity_key()
     entity           = current_entity()
     inv              = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
-    lines, vat, err  = fetch_line_items(entity, auto_index)
+    lines, vat, err  = fetch_line_items(entity, auto_index, entity_key)
     subtotal         = sum(l["amount"] for l in lines)
     return jsonify({
         "post_order":  auto_index,
@@ -1140,42 +1121,64 @@ def api_debug_schema():
 @app.route("/api/debug-sage")
 @login_required
 def api_debug_sage():
-    """Shows what's actually in dbo.InvNum for the current entity's DB."""
+    """Shows what PostAR sales rows look like for the current entity's branches."""
     entity = current_entity()
+    branch_col = entity.get("postar_branch_column", "iTxBranchID")
+    inc = entity.get("branch_include")
+    exc = entity.get("branch_exclude")
+    if inc:
+        bsql, bparams = f" AND ar.[{branch_col}] IN ({','.join('?'*len(inc))})", list(inc)
+    elif exc:
+        bsql, bparams = f" AND ar.[{branch_col}] NOT IN ({','.join('?'*len(exc))})", list(exc)
+    else:
+        bsql, bparams = "", []
     try:
         sage   = pyodbc.connect(entity_conn_str(entity), timeout=10)
         cursor = sage.cursor()
 
-        cursor.execute("""
-            SELECT DocType, COUNT(*) as cnt,
-                   MIN(CONVERT(varchar,InvDate,23)) as earliest,
-                   MAX(CONVERT(varchar,InvDate,23)) as latest
-            FROM dbo.InvNum
-            GROUP BY DocType
-            ORDER BY DocType
-        """)
-        doctype_summary = [
-            {"DocType": r[0], "count": r[1], "earliest": r[2], "latest": r[3]}
+        # Transaction-code breakdown for sales rows in this entity's branches.
+        cursor.execute(f"""
+            SELECT ar.[TrCodeID], ar.[Id], COUNT(*) AS cnt,
+                   SUM(ar.[Debit]) AS total_debit, SUM(ar.[Tax_Amount]) AS total_tax,
+                   MIN(CONVERT(varchar,ar.[TxDate],23)) AS earliest,
+                   MAX(CONVERT(varchar,ar.[TxDate],23)) AS latest
+            FROM dbo.PostAR ar
+            WHERE ar.[Id] = 'ARTx' AND ar.[Debit] > 0
+              AND ar.[Description] LIKE '%sales invoice%'
+              {bsql}
+            GROUP BY ar.[TrCodeID], ar.[Id]
+            ORDER BY total_debit DESC
+        """, bparams)
+        trcode_summary = [
+            {"TrCodeID": r[0], "Id": r[1], "count": r[2],
+             "total_debit": float(r[3] or 0), "total_tax": float(r[4] or 0),
+             "earliest": r[5], "latest": r[6]}
             for r in cursor.fetchall()
         ]
 
-        cursor.execute("""
-            SELECT TOP 5 AutoIndex, InvNumber, cAccountName, InvDate,
-                         InvTotExcl, InvTotTax, DocType
-            FROM dbo.InvNum WHERE DocType = 0 ORDER BY InvDate DESC
-        """)
-        inv_samples = [
-            {"AutoIndex": r[0], "InvNumber": r[1], "Customer": r[2],
-             "Date": str(r[3])[:10], "Excl": float(r[4] or 0), "Tax": float(r[5] or 0)}
+        cursor.execute(f"""
+            SELECT TOP 5 ar.[AutoIdx], ar.[Reference], ar.[Description], ar.[TxDate],
+                         ar.[Debit], ar.[Tax_Amount], ar.[TrCodeID]
+            FROM dbo.PostAR ar
+            WHERE ar.[Id] = 'ARTx' AND ar.[Debit] > 0
+              AND ar.[Description] LIKE '%sales invoice%'
+              {bsql}
+            ORDER BY ar.[TxDate] DESC
+        """, bparams)
+        sale_samples = [
+            {"AutoIdx": r[0], "Reference": r[1], "Description": r[2],
+             "Date": str(r[3])[:10], "Debit": float(r[4] or 0),
+             "Tax_Amount": float(r[5] or 0), "TrCodeID": r[6]}
             for r in cursor.fetchall()
         ]
 
         sage.close()
         return jsonify({
             "ok": True,
-            "doctype_summary": doctype_summary,
-            "invoice_samples (DocType 0)": inv_samples,
-            "note": "DocType 0=Invoice, 1=Credit Note.",
+            "source": "dbo.PostAR (Id=ARTx, Debit>0, Description LIKE '%sales invoice%')",
+            "trcode_summary": trcode_summary,
+            "sale_samples": sale_samples,
+            "note": "Debit is treated as tax-inclusive; VAT derived at vat_rate. Tax_Amount is usually 0 on PostAR sales rows.",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
@@ -1202,5 +1205,5 @@ if __name__ == "__main__":
     print("\n  Genesis Group E-Invoicing Dashboard (multi-entity)")
     print("  ===================================================")
     print("  http://localhost:5002")
-    print("  Login: 'Food 123' (Food) or 'Cenima 456' (Cinemas)\n")
+    print("  Login: 'new123' (Food) or 'new321' (Cinemas)\n")
     app.run(debug=False, host="0.0.0.0", port=5002)
