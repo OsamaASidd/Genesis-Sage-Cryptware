@@ -184,6 +184,7 @@ def init_db():
                 customer_tin TEXT, customer_email TEXT, customer_phone TEXT,
                 customer_address TEXT, customer_city TEXT, invoice_date TEXT,
                 amount REAL DEFAULT 0, vat_amount REAL DEFAULT 0,
+                branch_id INTEGER,
                 status TEXT DEFAULT 'pending',
                 irn TEXT, qr_code TEXT, posted_at TEXT,
                 error_message TEXT, api_response TEXT,
@@ -202,9 +203,15 @@ def init_db():
                 quantity REAL DEFAULT 1, unit_price REAL DEFAULT 0,
                 amount REAL DEFAULT 0, tax_rate REAL DEFAULT 0)""")
 
+            # Migration: add branch_id to a DB created before this column existed.
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()}
+            if "branch_id" not in existing_cols:
+                conn.execute("ALTER TABLE invoices ADD COLUMN branch_id INTEGER")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_status   ON invoices(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_customer ON invoices(customer_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_entity   ON invoices(entity)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_branch   ON invoices(entity, branch_id)")
             conn.commit()
         finally:
             conn.close()
@@ -400,11 +407,11 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 ops.append((
                     "UPDATE invoices SET invoice_num=?,customer_name=?,customer_id=?,"
                     "customer_tin=?,customer_email=?,customer_phone=?,customer_address=?,"
-                    "customer_city=?,invoice_date=?,amount=?,vat_amount=?,"
+                    "customer_city=?,invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
                     "invoice_description=?,invoice_type=?,cancel_ref=?,last_synced=? "
                     "WHERE post_order=? AND entity=?",
                     (inv_num, cust_name, cust_id, tin, email, phone,
-                     street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now,
+                     street, city, inv_date_str, excl, tax, row_branch, desc, inv_type, cancel_ref, now,
                      auto_idx, entity_key),
                 ))
         else:
@@ -413,10 +420,10 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 "INSERT INTO invoices "
                 "(post_order,entity,trx_number,invoice_num,customer_name,customer_id,"
                 "customer_tin,customer_email,customer_phone,customer_address,customer_city,"
-                "invoice_date,amount,vat_amount,status,invoice_description,invoice_type,cancel_ref,last_synced) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                "invoice_date,amount,vat_amount,branch_id,status,invoice_description,invoice_type,cancel_ref,last_synced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (auto_idx, entity_key, auto_idx, inv_num, cust_name, cust_id, tin, email, phone,
-                 street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now),
+                 street, city, inv_date_str, excl, tax, row_branch, desc, inv_type, cancel_ref, now),
             ))
 
     if ops:
@@ -428,6 +435,128 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
         "new":       new_count,
         "date_from": date_from,
         "date_to":   date_to,
+    }
+
+
+# --- GL-BASED SYNC (branches with no per-customer InvNum sales documents) -------
+
+def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
+    """
+    Some branches (e.g. till-based QSR/food outlets) never raise DocType 0/1
+    sales documents in dbo.InvNum - every InvNum row for them is a purchase
+    GRV. Their real sales only exist as General Ledger postings. For those
+    branches (entity["gl_branches"]), build ONE aggregate invoice per branch
+    per calendar month from dbo.PostGL, using the GL codes we were given:
+
+        31001, 31002  -> net sales, INCLUSIVE of VAT
+        23110         -> VAT
+
+    Billed to a generic "Walk-in Customers - <BranchCode>" account, since GL
+    postings carry no per-customer identity for these branches - this is an
+    aggregate branch total, not a reconstructed individual sale. Confirm this
+    aggregate-invoice approach is acceptable for FIRS before posting live.
+    """
+    gl_branches = entity.get("gl_branches") or []
+    if not gl_branches:
+        return {"ok": True, "synced": 0, "new": 0, "source": "PostGL"}
+
+    if not date_from:
+        date_from = "2020-01-01"
+    if not date_to:
+        date_to = date.today().strftime("%Y-%m-%d")
+
+    conn_str = entity_conn_str(entity)
+    try:
+        sage = pyodbc.connect(conn_str, timeout=15)
+    except Exception as e:
+        return {"ok": False, "error": f"DB connection: {e}", "source": "PostGL"}
+
+    try:
+        cursor = sage.cursor()
+        placeholders = ",".join("?" * len(gl_branches))
+        sql = f"""
+            SELECT
+                pg.iTxBranchID  AS branch_id,
+                b.cBranchCode   AS branch_code,
+                YEAR(pg.TxDate)  AS yr,
+                MONTH(pg.TxDate) AS mo,
+                SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
+                         THEN pg.Credit - pg.Debit ELSE 0 END) AS gross_incl_vat,
+                SUM(CASE WHEN a.Account LIKE '23110/%'
+                         THEN pg.Credit - pg.Debit ELSE 0 END) AS vat
+            FROM dbo.PostGL pg
+            JOIN dbo.Accounts a     ON a.AccountLink = pg.AccountLink
+            JOIN dbo._etblBranch b ON b.idBranch = pg.iTxBranchID
+            WHERE pg.iTxBranchID IN ({placeholders})
+              AND pg.TxDate >= ? AND pg.TxDate < DATEADD(day, 1, CAST(? AS date))
+              AND (a.Account LIKE '31001/%' OR a.Account LIKE '31002/%' OR a.Account LIKE '23110/%')
+            GROUP BY pg.iTxBranchID, b.cBranchCode, YEAR(pg.TxDate), MONTH(pg.TxDate)
+            ORDER BY yr, mo, pg.iTxBranchID
+        """
+        cursor.execute(sql, list(gl_branches) + [date_from, date_to])
+        rows = cursor.fetchall()
+        print(f"[SYNC-GL:{entity_key}] {len(rows)} branch-month rows for branches "
+              f"{gl_branches}, {date_from} -> {date_to}")
+    except Exception as e:
+        sage.close()
+        return {"ok": False, "error": str(e), "source": "PostGL"}
+    finally:
+        sage.close()
+
+    existing = {r["post_order"]: r["status"]
+                for r in db_read("SELECT post_order, status FROM invoices WHERE entity=?", (entity_key,))}
+
+    now       = datetime.now().isoformat()
+    ops       = []
+    new_count = 0
+
+    for branch_id, branch_code, yr, mo, gross, vat in rows:
+        gross = to_float(gross)
+        vat   = to_float(vat)
+        if gross == 0 and vat == 0:
+            continue
+        excl = round(gross - vat, 2)
+
+        # Stable synthetic ID (negative, so it can never collide with a real
+        # InvNum AutoIndex, which is always positive).
+        post_order  = -(int(branch_id) * 1000000 + yr * 100 + mo)
+        month_label = f"{yr:04d}-{mo:02d}"
+        inv_num     = f"GL-{branch_code}-{month_label}"
+        inv_date    = date(yr, mo, 1).strftime("%Y-%m-%d")
+        cust_name   = f"Walk-in Customers - {branch_code}"
+        cust_id     = f"GL-{branch_code}"
+        desc        = (f"Aggregate branch sales ({branch_code}) - {month_label} "
+                        f"- GL codes 31001/31002 (net sales) & 23110 (VAT)")
+
+        if post_order in existing:
+            if existing[post_order] != "posted":
+                ops.append((
+                    "UPDATE invoices SET invoice_num=?,customer_name=?,customer_id=?,"
+                    "invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
+                    "invoice_description=?,invoice_type=?,last_synced=? "
+                    "WHERE post_order=? AND entity=?",
+                    (inv_num, cust_name, cust_id, inv_date, excl, vat, branch_id,
+                     desc, "Invoice", now, post_order, entity_key),
+                ))
+        else:
+            new_count += 1
+            ops.append((
+                "INSERT INTO invoices "
+                "(post_order,entity,trx_number,invoice_num,customer_name,customer_id,"
+                "customer_tin,customer_email,customer_phone,customer_address,customer_city,"
+                "invoice_date,amount,vat_amount,branch_id,status,invoice_description,invoice_type,cancel_ref,last_synced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                (post_order, entity_key, post_order, inv_num, cust_name, cust_id,
+                 "", "", "", "", "",
+                 inv_date, excl, vat, branch_id, desc, "Invoice", "", now),
+            ))
+
+    if ops:
+        db_write_many(ops)
+
+    return {
+        "ok": True, "synced": len(rows), "new": new_count,
+        "date_from": date_from, "date_to": date_to, "source": "PostGL",
     }
 
 
@@ -537,7 +666,10 @@ def build_payload(auto_index, entity_key, entity):
     product_cat  = entity["product_category"]
     default_city = entity["supplier"]["postal_address"].get("city_name", "Port Harcourt")
 
-    lines, vat_amount, line_error = fetch_line_items(entity, inv["post_order"])
+    lines, vat_amount, line_error = (
+        ([], 0, None) if auto_index < 0    # synthetic GL-aggregate invoice: no
+        else fetch_line_items(entity, inv["post_order"])  # per-line data in Sage to fetch
+    )
 
     if not lines:
         amt = abs(to_float(inv["amount"]))
@@ -917,6 +1049,7 @@ def index():
     page          = request.args.get("page",   1,  type=int)
     q             = request.args.get("q",      "").strip()
     status_filter = request.args.get("status", "").strip()
+    branch_filter = request.args.get("branch_id", "").strip()
     today         = date.today()
     default_from  = "2020-01-01"
     default_to    = today.strftime("%Y-%m-%d")
@@ -948,6 +1081,8 @@ def index():
             params += [like, like, like]
         if status_filter in ("pending", "posted", "failed"):
             where_parts.append("status = ?"); params.append(status_filter)
+        if branch_filter:
+            where_parts.append("branch_id = ?"); params.append(int(branch_filter))
 
         where_sql   = "WHERE " + " AND ".join(where_parts)
         count_row   = db_read_one(f"SELECT COUNT(*) as cnt FROM invoices {where_sql}", tuple(params))
@@ -963,13 +1098,24 @@ def index():
         invoices = []; stats = {"total":0,"posted":0,"pending":0,"failed":0,"credit_notes":0,"invoices_count":0}
         total = 0; total_pages = 1; page = 1
 
+    # Branch selector: prefer the entity's configured branch list; fall back to
+    # whatever branch IDs have actually been synced for this entity.
+    branches = entity.get("branch_include")
+    if not branches:
+        rows = db_read(
+            "SELECT DISTINCT branch_id FROM invoices "
+            "WHERE entity=? AND branch_id IS NOT NULL ORDER BY branch_id", (entity_key,))
+        branches = [r["branch_id"] for r in rows]
+    else:
+        branches = sorted(branches)
+
     return render_template(
         "index.html",
         invoices=invoices, stats=stats,
         page=page, total_pages=total_pages, total=total,
-        q=q, status_filter=status_filter,
+        q=q, status_filter=status_filter, branch_filter=branch_filter,
         date_from=date_from, date_to=date_to,
-        entity_label=entity_label,
+        entity_label=entity_label, branches=branches,
     )
 
 
@@ -979,8 +1125,27 @@ def api_sync():
     entity_key = current_entity_key()
     entity     = current_entity()
     data = request.get_json(silent=True) or {}
-    return jsonify(sync_from_sage(entity_key, entity,
-                                  date_from=data.get("date_from"), date_to=data.get("date_to")))
+    date_from = data.get("date_from")
+    date_to   = data.get("date_to")
+
+    r_invnum = sync_from_sage(entity_key, entity, date_from=date_from, date_to=date_to)
+    r_gl     = sync_gl_branches(entity_key, entity, date_from=date_from, date_to=date_to)
+
+    if not r_invnum.get("ok") and not r_gl.get("ok"):
+        return jsonify({"ok": False, "error":
+                         f"InvNum: {r_invnum.get('error')} | GL: {r_gl.get('error')}"})
+
+    return jsonify({
+        "ok":         True,
+        "synced":     r_invnum.get("synced", 0) + r_gl.get("synced", 0),
+        "new":        r_invnum.get("new", 0) + r_gl.get("new", 0),
+        "date_from":  r_invnum.get("date_from") or r_gl.get("date_from"),
+        "date_to":    r_invnum.get("date_to") or r_gl.get("date_to"),
+        "invnum":     {"synced": r_invnum.get("synced", 0), "new": r_invnum.get("new", 0),
+                       "error": r_invnum.get("error")},
+        "gl":         {"synced": r_gl.get("synced", 0), "new": r_gl.get("new", 0),
+                       "error": r_gl.get("error")},
+    })
 
 
 @app.route("/api/post/<int:auto_index>", methods=["POST"])
