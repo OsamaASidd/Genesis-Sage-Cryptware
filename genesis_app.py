@@ -448,15 +448,26 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     branches (entity["gl_branches"]), build ONE aggregate invoice per branch
     per calendar month from dbo.PostGL, using the GL codes we were given:
 
-        31001, 31002  -> net sales, INCLUSIVE of VAT
-        23110         -> VAT
+        31001, 31002  -> net sales
+        23110         -> VAT (where the branch actually has a 23110 sub-account)
+
+    Two VAT conventions, selected per-branch via entity["vat_calc_branches"]:
+      - Default (branch NOT in vat_calc_branches): 31001/31002 is INCLUSIVE of
+        VAT, and VAT is read directly from that branch's 23110 sub-account.
+        excl = (31001+31002 sum) - (23110 sum)
+      - Branch IN vat_calc_branches (e.g. branch 1/IC, which has no 23110
+        sub-account at all): 31001/31002 is EXCLUSIVE of VAT, and VAT is
+        calculated as 7.5% added on top.
+        vat = excl * 0.075 ; gross = excl + vat
 
     Billed to a generic "Walk-in Customers - <BranchCode>" account, since GL
     postings carry no per-customer identity for these branches - this is an
     aggregate branch total, not a reconstructed individual sale. Confirm this
     aggregate-invoice approach is acceptable for FIRS before posting live.
     """
-    gl_branches = entity.get("gl_branches") or []
+    VAT_RATE = 0.075
+    gl_branches      = entity.get("gl_branches") or []
+    vat_calc_branches = set(entity.get("vat_calc_branches") or [])
     if not gl_branches:
         return {"ok": True, "synced": 0, "new": 0, "source": "PostGL"}
 
@@ -481,9 +492,9 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                 YEAR(pg.TxDate)  AS yr,
                 MONTH(pg.TxDate) AS mo,
                 SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
-                         THEN pg.Credit - pg.Debit ELSE 0 END) AS gross_incl_vat,
+                         THEN pg.Credit - pg.Debit ELSE 0 END) AS raw_sales,
                 SUM(CASE WHEN a.Account LIKE '23110/%'
-                         THEN pg.Credit - pg.Debit ELSE 0 END) AS vat
+                         THEN pg.Credit - pg.Debit ELSE 0 END) AS vat_from_gl
             FROM dbo.PostGL pg
             JOIN dbo.Accounts a     ON a.AccountLink = pg.AccountLink
             JOIN dbo._etblBranch b ON b.idBranch = pg.iTxBranchID
@@ -510,12 +521,22 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     ops       = []
     new_count = 0
 
-    for branch_id, branch_code, yr, mo, gross, vat in rows:
-        gross = to_float(gross)
-        vat   = to_float(vat)
-        if gross == 0 and vat == 0:
+    for branch_id, branch_code, yr, mo, raw_sales, vat_from_gl in rows:
+        raw_sales  = to_float(raw_sales)
+        vat_from_gl = to_float(vat_from_gl)
+        if raw_sales == 0 and vat_from_gl == 0:
             continue
-        excl = round(gross - vat, 2)
+
+        if int(branch_id) in vat_calc_branches:
+            # 31001/31002 is EXCLUSIVE of VAT here - calculate VAT on top.
+            excl = round(raw_sales, 2)
+            vat  = round(excl * VAT_RATE, 2)
+            gross = round(excl + vat, 2)
+        else:
+            # 31001/31002 is INCLUSIVE of VAT - VAT comes straight from 23110.
+            gross = round(raw_sales, 2)
+            vat   = round(vat_from_gl, 2)
+            excl  = round(gross - vat, 2)
 
         # Stable synthetic ID (negative, so it can never collide with a real
         # InvNum AutoIndex, which is always positive).
@@ -525,8 +546,11 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         inv_date    = date(yr, mo, 1).strftime("%Y-%m-%d")
         cust_name   = f"Walk-in Customers - {branch_code}"
         cust_id     = f"GL-{branch_code}"
+        vat_note    = ("VAT calculated at 7.5% on top of exclusive net sales"
+                        if int(branch_id) in vat_calc_branches
+                        else "VAT per GL code 23110")
         desc        = (f"Aggregate branch sales ({branch_code}) - {month_label} "
-                        f"- GL codes 31001/31002 (net sales) & 23110 (VAT)")
+                        f"- GL codes 31001/31002 (net sales), {vat_note}")
 
         if post_order in existing:
             if existing[post_order] != "posted":
