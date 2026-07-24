@@ -39,4 +39,5 @@ resources/
 # Credentials
 *.key
 *.pem
-*.cert
+*.cert*.db-wal
+*.db-shm
