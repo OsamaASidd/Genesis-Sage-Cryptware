@@ -520,6 +520,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     now       = datetime.now().isoformat()
     ops       = []
     new_count = 0
+    skipped   = 0
 
     for branch_id, branch_code, yr, mo, raw_sales, vat_from_gl in rows:
         raw_sales  = to_float(raw_sales)
@@ -537,6 +538,17 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
             gross = round(raw_sales, 2)
             vat   = round(vat_from_gl, 2)
             excl  = round(gross - vat, 2)
+            if excl < 0:
+                # VAT exceeds gross sales - the 23110 postings for this branch
+                # almost certainly include non-sales-VAT activity (remittance/
+                # clearing entries etc), not just VAT on sales. Skip rather
+                # than write a nonsensical negative invoice total; this branch
+                # needs its 23110 postings investigated before it can sync.
+                print(f"[SYNC-GL:{entity_key}] SKIP branch {branch_id} {yr}-{mo:02d}: "
+                      f"VAT ({vat}) exceeds gross sales ({gross}) - excl would be "
+                      f"negative ({excl}). Needs investigation, not synced.")
+                skipped += 1
+                continue
 
         # Stable synthetic ID (negative, so it can never collide with a real
         # InvNum AutoIndex, which is always positive).
@@ -579,7 +591,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         db_write_many(ops)
 
     return {
-        "ok": True, "synced": len(rows), "new": new_count,
+        "ok": True, "synced": len(rows) - skipped, "new": new_count, "skipped": skipped,
         "date_from": date_from, "date_to": date_to, "source": "PostGL",
     }
 
@@ -1168,7 +1180,7 @@ def api_sync():
         "invnum":     {"synced": r_invnum.get("synced", 0), "new": r_invnum.get("new", 0),
                        "error": r_invnum.get("error")},
         "gl":         {"synced": r_gl.get("synced", 0), "new": r_gl.get("new", 0),
-                       "error": r_gl.get("error")},
+                       "skipped": r_gl.get("skipped", 0), "error": r_gl.get("error")},
     })
 
 
