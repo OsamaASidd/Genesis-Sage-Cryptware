@@ -184,7 +184,6 @@ def init_db():
                 customer_tin TEXT, customer_email TEXT, customer_phone TEXT,
                 customer_address TEXT, customer_city TEXT, invoice_date TEXT,
                 amount REAL DEFAULT 0, vat_amount REAL DEFAULT 0,
-                branch_id INTEGER,
                 status TEXT DEFAULT 'pending',
                 irn TEXT, qr_code TEXT, posted_at TEXT,
                 error_message TEXT, api_response TEXT,
@@ -203,15 +202,9 @@ def init_db():
                 quantity REAL DEFAULT 1, unit_price REAL DEFAULT 0,
                 amount REAL DEFAULT 0, tax_rate REAL DEFAULT 0)""")
 
-            # Migration: add branch_id to a DB created before this column existed.
-            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()}
-            if "branch_id" not in existing_cols:
-                conn.execute("ALTER TABLE invoices ADD COLUMN branch_id INTEGER")
-
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_status   ON invoices(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_customer ON invoices(customer_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_entity   ON invoices(entity)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_branch   ON invoices(entity, branch_id)")
             conn.commit()
         finally:
             conn.close()
@@ -407,11 +400,11 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 ops.append((
                     "UPDATE invoices SET invoice_num=?,customer_name=?,customer_id=?,"
                     "customer_tin=?,customer_email=?,customer_phone=?,customer_address=?,"
-                    "customer_city=?,invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
+                    "customer_city=?,invoice_date=?,amount=?,vat_amount=?,"
                     "invoice_description=?,invoice_type=?,cancel_ref=?,last_synced=? "
                     "WHERE post_order=? AND entity=?",
                     (inv_num, cust_name, cust_id, tin, email, phone,
-                     street, city, inv_date_str, excl, tax, row_branch, desc, inv_type, cancel_ref, now,
+                     street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now,
                      auto_idx, entity_key),
                 ))
         else:
@@ -420,10 +413,10 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
                 "INSERT INTO invoices "
                 "(post_order,entity,trx_number,invoice_num,customer_name,customer_id,"
                 "customer_tin,customer_email,customer_phone,customer_address,customer_city,"
-                "invoice_date,amount,vat_amount,branch_id,status,invoice_description,invoice_type,cancel_ref,last_synced) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                "invoice_date,amount,vat_amount,status,invoice_description,invoice_type,cancel_ref,last_synced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (auto_idx, entity_key, auto_idx, inv_num, cust_name, cust_id, tin, email, phone,
-                 street, city, inv_date_str, excl, tax, row_branch, desc, inv_type, cancel_ref, now),
+                 street, city, inv_date_str, excl, tax, desc, inv_type, cancel_ref, now),
             ))
 
     if ops:
@@ -924,7 +917,6 @@ def index():
     page          = request.args.get("page",   1,  type=int)
     q             = request.args.get("q",      "").strip()
     status_filter = request.args.get("status", "").strip()
-    branch_filter = request.args.get("branch_id", "").strip()
     today         = date.today()
     default_from  = "2020-01-01"
     default_to    = today.strftime("%Y-%m-%d")
@@ -956,8 +948,6 @@ def index():
             params += [like, like, like]
         if status_filter in ("pending", "posted", "failed"):
             where_parts.append("status = ?"); params.append(status_filter)
-        if branch_filter:
-            where_parts.append("branch_id = ?"); params.append(int(branch_filter))
 
         where_sql   = "WHERE " + " AND ".join(where_parts)
         count_row   = db_read_one(f"SELECT COUNT(*) as cnt FROM invoices {where_sql}", tuple(params))
@@ -973,24 +963,13 @@ def index():
         invoices = []; stats = {"total":0,"posted":0,"pending":0,"failed":0,"credit_notes":0,"invoices_count":0}
         total = 0; total_pages = 1; page = 1
 
-    # Branch selector: prefer the entity's configured branch list; fall back to
-    # whatever branch IDs have actually been synced for this entity.
-    branches = entity.get("branch_include")
-    if not branches:
-        rows = db_read(
-            "SELECT DISTINCT branch_id FROM invoices "
-            "WHERE entity=? AND branch_id IS NOT NULL ORDER BY branch_id", (entity_key,))
-        branches = [r["branch_id"] for r in rows]
-    else:
-        branches = sorted(branches)
-
     return render_template(
         "index.html",
         invoices=invoices, stats=stats,
         page=page, total_pages=total_pages, total=total,
-        q=q, status_filter=status_filter, branch_filter=branch_filter,
+        q=q, status_filter=status_filter,
         date_from=date_from, date_to=date_to,
-        entity_label=entity_label, branches=branches,
+        entity_label=entity_label,
     )
 
 
