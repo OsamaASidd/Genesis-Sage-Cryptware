@@ -39,5 +39,11 @@ resources/
 # Credentials
 *.key
 *.pem
-*.cert*.db-wal
+*.cert
+
+# Databases (contain live Sage/customer data - never commit)
+*.db
+*.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
