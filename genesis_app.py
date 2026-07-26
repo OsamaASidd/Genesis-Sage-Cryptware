@@ -11,7 +11,7 @@ Login:
 Invoices are isolated per entity via the `entity` column in SQLite.
 """
 
-import os, io, re, sqlite3, threading, functools, pyodbc, requests
+import os, io, re, sqlite3, threading, functools, hashlib, pyodbc, requests
 from datetime import datetime, date
 from decimal import Decimal
 from flask import (
@@ -445,8 +445,8 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     Some branches (e.g. till-based QSR/food outlets) never raise DocType 0/1
     sales documents in dbo.InvNum - every InvNum row for them is a purchase
     GRV. Their real sales only exist as General Ledger postings. For those
-    branches (entity["gl_branches"]), build ONE aggregate invoice per branch
-    per calendar month from dbo.PostGL, using the GL codes we were given:
+    branches (entity["gl_branches"]), build aggregate invoices from
+    dbo.PostGL using the GL codes we were given:
 
         31001, 31002  -> net sales
         23110         -> VAT (where the branch actually has a 23110 sub-account)
@@ -460,14 +460,21 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         calculated as 7.5% added on top.
         vat = excl * 0.075 ; gross = excl + vat
 
-    Billed to a generic "Walk-in Customers - <BranchCode>" account, since GL
-    postings carry no per-customer identity for these branches - this is an
-    aggregate branch total, not a reconstructed individual sale. Confirm this
-    aggregate-invoice approach is acceptable for FIRS before posting live.
+    Grouping granularity, controlled by entity["gl_group_by_client"]:
+      - False/unset (e.g. Cinemas): one invoice per branch PER DAY, billed to
+        a generic "Walk-in Customers - <BranchCode>" account - GL postings
+        carry no per-customer identity here.
+      - True (e.g. Food): one invoice per branch PER DAY PER CLIENT, using
+        dbo.PostGL.cPayeeName as the client identifier. NOTE: this assumes
+        cPayeeName is populated on 31001/31002/23110 postings - verify this
+        looks sensible after the first sync (not blank for everything).
+        Postings with no payee name fall back to a generic "Walk-in Customer"
+        bucket for that branch/day rather than being silently dropped.
     """
-    VAT_RATE = 0.075
-    gl_branches      = entity.get("gl_branches") or []
+    VAT_RATE          = 0.075
+    gl_branches       = entity.get("gl_branches") or []
     vat_calc_branches = set(entity.get("vat_calc_branches") or [])
+    group_by_client   = bool(entity.get("gl_group_by_client"))
     if not gl_branches:
         return {"ok": True, "synced": 0, "new": 0, "source": "PostGL"}
 
@@ -485,12 +492,20 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     try:
         cursor = sage.cursor()
         placeholders = ",".join("?" * len(gl_branches))
+
+        if group_by_client:
+            select_extra = "COALESCE(NULLIF(LTRIM(RTRIM(pg.cPayeeName)), ''), 'Walk-in Customer') AS client_name,"
+            group_extra  = ", COALESCE(NULLIF(LTRIM(RTRIM(pg.cPayeeName)), ''), 'Walk-in Customer')"
+        else:
+            select_extra = ""
+            group_extra  = ""
+
         sql = f"""
             SELECT
-                pg.iTxBranchID  AS branch_id,
-                b.cBranchCode   AS branch_code,
-                YEAR(pg.TxDate)  AS yr,
-                MONTH(pg.TxDate) AS mo,
+                pg.iTxBranchID   AS branch_id,
+                b.cBranchCode    AS branch_code,
+                CAST(pg.TxDate AS DATE) AS tx_date,
+                {select_extra}
                 SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
                          THEN pg.Credit - pg.Debit ELSE 0 END) AS raw_sales,
                 SUM(CASE WHEN a.Account LIKE '23110/%'
@@ -501,12 +516,14 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
             WHERE pg.iTxBranchID IN ({placeholders})
               AND pg.TxDate >= ? AND pg.TxDate < DATEADD(day, 1, CAST(? AS date))
               AND (a.Account LIKE '31001/%' OR a.Account LIKE '31002/%' OR a.Account LIKE '23110/%')
-            GROUP BY pg.iTxBranchID, b.cBranchCode, YEAR(pg.TxDate), MONTH(pg.TxDate)
-            ORDER BY yr, mo, pg.iTxBranchID
+            GROUP BY pg.iTxBranchID, b.cBranchCode, CAST(pg.TxDate AS DATE){group_extra}
+            ORDER BY tx_date, branch_id
         """
+
         cursor.execute(sql, list(gl_branches) + [date_from, date_to])
         rows = cursor.fetchall()
-        print(f"[SYNC-GL:{entity_key}] {len(rows)} branch-month rows for branches "
+        print(f"[SYNC-GL:{entity_key}] {len(rows)} rows "
+              f"({'branch/day/client' if group_by_client else 'branch/day'}) for branches "
               f"{gl_branches}, {date_from} -> {date_to}")
     except Exception as e:
         sage.close()
@@ -522,17 +539,22 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     new_count = 0
     skipped   = 0
 
-    for branch_id, branch_code, yr, mo, raw_sales, vat_from_gl in rows:
-        raw_sales  = to_float(raw_sales)
+    for row in rows:
+        if group_by_client:
+            branch_id, branch_code, tx_date, client_name, raw_sales, vat_from_gl = row
+        else:
+            branch_id, branch_code, tx_date, raw_sales, vat_from_gl = row
+            client_name = None
+
+        raw_sales   = to_float(raw_sales)
         vat_from_gl = to_float(vat_from_gl)
         if raw_sales == 0 and vat_from_gl == 0:
             continue
 
         if int(branch_id) in vat_calc_branches:
             # 31001/31002 is EXCLUSIVE of VAT here - calculate VAT on top.
-            excl = round(raw_sales, 2)
-            vat  = round(excl * VAT_RATE, 2)
-            gross = round(excl + vat, 2)
+            excl  = round(raw_sales, 2)
+            vat   = round(excl * VAT_RATE, 2)
         else:
             # 31001/31002 is INCLUSIVE of VAT - VAT comes straight from 23110.
             gross = round(raw_sales, 2)
@@ -544,25 +566,39 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                 # clearing entries etc), not just VAT on sales. Skip rather
                 # than write a nonsensical negative invoice total; this branch
                 # needs its 23110 postings investigated before it can sync.
-                print(f"[SYNC-GL:{entity_key}] SKIP branch {branch_id} {yr}-{mo:02d}: "
+                print(f"[SYNC-GL:{entity_key}] SKIP branch {branch_id} {tx_date}"
+                      f"{' (' + client_name + ')' if client_name else ''}: "
                       f"VAT ({vat}) exceeds gross sales ({gross}) - excl would be "
                       f"negative ({excl}). Needs investigation, not synced.")
                 skipped += 1
                 continue
 
-        # Stable synthetic ID (negative, so it can never collide with a real
-        # InvNum AutoIndex, which is always positive).
-        post_order  = -(int(branch_id) * 1000000 + yr * 100 + mo)
-        month_label = f"{yr:04d}-{mo:02d}"
-        inv_num     = f"GL-{branch_code}-{month_label}"
-        inv_date    = date(yr, mo, 1).strftime("%Y-%m-%d")
-        cust_name   = f"Walk-in Customers - {branch_code}"
-        cust_id     = f"GL-{branch_code}"
-        vat_note    = ("VAT calculated at 7.5% on top of exclusive net sales"
-                        if int(branch_id) in vat_calc_branches
-                        else "VAT per GL code 23110")
-        desc        = (f"Aggregate branch sales ({branch_code}) - {month_label} "
-                        f"- GL codes 31001/31002 (net sales), {vat_note}")
+        date_label = tx_date.strftime("%Y-%m-%d") if hasattr(tx_date, "strftime") else str(tx_date)
+        vat_note   = ("VAT calculated at 7.5% on top of exclusive net sales"
+                      if int(branch_id) in vat_calc_branches
+                      else "VAT per GL code 23110")
+
+        if group_by_client:
+            slug        = re.sub(r"[^A-Za-z0-9]+", "-", client_name).strip("-").upper()[:24] or "CUST"
+            # Stable synthetic ID derived from a hash of branch/date/client -
+            # negative so it can never collide with a real InvNum AutoIndex.
+            h           = int(hashlib.sha1(f"{branch_id}|{date_label}|{client_name}".encode()).hexdigest(), 16)
+            post_order  = -(h % 900_000_000 + 100_000_000)
+            inv_num     = f"GL-{branch_code}-{slug}-{date_label}"
+            cust_name   = client_name
+            cust_id     = f"GL-{branch_code}-{slug}"
+            desc        = (f"Aggregate sales ({branch_code}, {client_name}) - {date_label} "
+                            f"- GL codes 31001/31002 (net sales), {vat_note}")
+        else:
+            # Stable synthetic ID (negative, so it can never collide with a
+            # real InvNum AutoIndex, which is always positive).
+            ymd         = int(tx_date.strftime("%Y%m%d") if hasattr(tx_date, "strftime") else str(tx_date).replace("-", ""))
+            post_order  = -(int(branch_id) * 100_000_000 + ymd)
+            inv_num     = f"GL-{branch_code}-{date_label}"
+            cust_name   = f"Walk-in Customers - {branch_code}"
+            cust_id     = f"GL-{branch_code}"
+            desc        = (f"Aggregate branch sales ({branch_code}) - {date_label} "
+                            f"- GL codes 31001/31002 (net sales), {vat_note}")
 
         if post_order in existing:
             if existing[post_order] != "posted":
@@ -571,7 +607,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                     "invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
                     "invoice_description=?,invoice_type=?,last_synced=? "
                     "WHERE post_order=? AND entity=?",
-                    (inv_num, cust_name, cust_id, inv_date, excl, vat, branch_id,
+                    (inv_num, cust_name, cust_id, date_label, excl, vat, branch_id,
                      desc, "Invoice", now, post_order, entity_key),
                 ))
         else:
@@ -584,7 +620,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (post_order, entity_key, post_order, inv_num, cust_name, cust_id,
                  "", "", "", "", "",
-                 inv_date, excl, vat, branch_id, desc, "Invoice", "", now),
+                 date_label, excl, vat, branch_id, desc, "Invoice", "", now),
             ))
 
     if ops:
