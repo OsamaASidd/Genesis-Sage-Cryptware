@@ -573,6 +573,14 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                 skipped += 1
                 continue
 
+        # After rounding, some near-zero net movements (Credit/Debit that
+        # almost fully cancel out) round down to an invoice totalling 0.00.
+        # These aren't real sales - skip rather than clutter the dashboard
+        # with zero-value invoices.
+        if round(excl + vat, 2) == 0:
+            skipped += 1
+            continue
+
         date_label = tx_date.strftime("%Y-%m-%d") if hasattr(tx_date, "strftime") else str(tx_date)
         vat_note   = ("VAT calculated at 7.5% on top of exclusive net sales"
                       if int(branch_id) in vat_calc_branches
