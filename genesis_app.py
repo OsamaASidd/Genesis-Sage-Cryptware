@@ -438,6 +438,189 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
     }
 
 
+# --- GL OUTLET-WISE SYNC (till-only branches: FCT, QSR, SKY, PHT) ---------------
+#
+# Branches 2 (FCT), 5 (QSR), 6 (SKY), 9 (PHT) never raise per-customer DocType
+# 0/1 sales documents in dbo.InvNum - confirmed every InvNum row for them is a
+# purchase GRV. There is no customer identity anywhere in Sage for their till
+# sales (dbo.PostGL.cPayeeName is blank on every checked posting). What DOES
+# exist, per the client's own reference sheet, is a real per-OUTLET dimension:
+# the 4th segment of the account code (e.g. 31001/GF/QSR/WAR -> "WARRI MALL").
+#
+# This is deliberately NOT customer-wise (no customer exists in the source
+# data) - it's outlet-wise, which is what the client's mapping file actually
+# describes. Revenue comes from GL codes 31001/31002 only; VAT is CALCULATED
+# at 7.5% (not read from 23110 - proven unreliable/uncorrelated earlier in
+# this investigation), matching the same convention already used for
+# Food branch 1.
+#
+# KNOWN DATA CONFLICTS in the client's mapping (not resolved - using best
+# guess, flag to client for a corrected sheet):
+#   - PHT/JEY and PHT/SOP: client's sheet lists BOTH 31001 and 31003 as
+#     "Sales-Laundry", and BOTH 31002 and 31005 as "Sales-Accommodation" for
+#     these two properties (inconsistent with CAS/PAK's clean pattern:
+#     31001=Food, 31002=Drinks, 31003=Laundry, 31005=Accommodation,
+#     31006=Hall). Grouping here is by outlet only (ignoring revenue-type
+#     sub-code), so this conflict doesn't affect totals, just any future
+#     food/drinks/laundry breakdown.
+#   - 31001/GH/PHT/CAS is listed TWICE in the client's sheet under two
+#     different property names: "Castle Cage" and "Genesis Place Hotel".
+#     Using "Castle Cage" (first occurrence) below - CONFIRM WITH CLIENT.
+GL_OUTLET_NAMES = {
+    # (branch_code, outlet_code) -> display name
+    ("QSR", "AGP"): "AGIP",
+    ("QSR", "AGG"): "ADA GEORGE",
+    ("QSR", "UPA"): "ANNEX",
+    ("QSR", "ARP"): "ARRIVAL",
+    ("QSR", "ADL"): "DEPARTURE",
+    ("QSR", "ELE"): "ELELENWO",
+    ("QSR", "ROM"): "MARKET JUNCTION",
+    ("QSR", "SRA"): "SHELL GATE",
+    ("QSR", "WIP"): "WIMPY",
+    ("QSR", "ICB"): "T/AMADI",
+    ("QSR", "WOJ"): "WOJI",
+    ("QSR", "KRS"): "KUWURISI",
+    ("QSR", "CHB"): "CHOBA",
+    ("QSR", "APB"): "KUWURISI BAKERY",
+    ("QSR", "ONS"): "ONITSHA",
+    ("QSR", "ORO"): "ORLU ROAD",
+    ("QSR", "OWE"): "OWERRI MALL",
+    ("QSR", "OWB"): "OWERRI BAKERY",
+    ("QSR", "BNM"): "BENIN MALL",
+    ("QSR", "WAR"): "WARRI MALL",
+    ("QSR", "ASA"): "ASABA MALL",
+    ("QSR", "EKU"): "TRANS EKULU",
+    ("QSR", "ZIK"): "ZIK",
+    ("QSR", "AGB"): "AGBANI",
+    ("QSR", "ABJ"): "APO MALL",
+    ("QSR", "GWP"): "GWARIMPA",
+    ("QSR", "WUE"): "WUSE",
+    ("QSR", "ABB"): "ABUJA BAKERY",
+    ("QSR", "ADM"): "ADMIRALITY",
+    ("QSR", "ADO"): "ADEOLA ODEKU",
+    ("QSR", "CVN"): "CHEVERON",
+    ("QSR", "OGB"): "OGBA",
+    ("FCT", "GCD"): "FOOD COURT",
+    ("SKY", "SKY"): "SKY BAR",
+    ("PHT", "CAS"): "CASTLE CAGE",       # ambiguous - see note above
+    ("PHT", "JEY"): "JERSEY",
+    ("PHT", "SOP"): "REVENTON PARK",
+    ("PHT", "PAK"): "GENESIS PARK",
+}
+
+
+def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
+    """
+    Outlet-wise aggregate sync for till-only branches (entity["gl_outlet_branches"]).
+    One invoice per branch per outlet per day. See module notes above for the
+    revenue/VAT convention and known mapping conflicts.
+    """
+    VAT_RATE = 0.075
+    gl_branches = entity.get("gl_outlet_branches") or []
+    if not gl_branches:
+        return {"ok": True, "synced": 0, "new": 0, "source": "PostGL-outlet"}
+
+    if not date_from:
+        date_from = "2020-01-01"
+    if not date_to:
+        date_to = date.today().strftime("%Y-%m-%d")
+
+    conn_str = entity_conn_str(entity)
+    try:
+        sage = pyodbc.connect(conn_str, timeout=15)
+    except Exception as e:
+        return {"ok": False, "error": f"DB connection: {e}", "source": "PostGL-outlet"}
+
+    try:
+        cursor = sage.cursor()
+        placeholders = ",".join("?" * len(gl_branches))
+        sql = f"""
+            SELECT
+                pg.iTxBranchID AS branch_id,
+                b.cBranchCode  AS branch_code,
+                PARSENAME(REPLACE(a.Account, '/', '.'), 1) AS outlet_code,
+                CAST(pg.TxDate AS DATE) AS tx_date,
+                SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
+                         THEN pg.Credit - pg.Debit ELSE 0 END) AS net_sales
+            FROM dbo.PostGL pg
+            JOIN dbo.Accounts a     ON a.AccountLink = pg.AccountLink
+            JOIN dbo._etblBranch b ON b.idBranch = pg.iTxBranchID
+            WHERE pg.iTxBranchID IN ({placeholders})
+              AND pg.TxDate >= ? AND pg.TxDate < DATEADD(day, 1, CAST(? AS date))
+              AND (a.Account LIKE '31001/%' OR a.Account LIKE '31002/%')
+            GROUP BY pg.iTxBranchID, b.cBranchCode,
+                     PARSENAME(REPLACE(a.Account, '/', '.'), 1), CAST(pg.TxDate AS DATE)
+            ORDER BY tx_date, branch_id, outlet_code
+        """
+        cursor.execute(sql, list(gl_branches) + [date_from, date_to])
+        rows = cursor.fetchall()
+        print(f"[SYNC-GL-OUTLET:{entity_key}] {len(rows)} branch/outlet/day rows for "
+              f"branches {gl_branches}, {date_from} -> {date_to}")
+    except Exception as e:
+        sage.close()
+        return {"ok": False, "error": str(e), "source": "PostGL-outlet"}
+    finally:
+        sage.close()
+
+    existing = {r["post_order"]: r["status"]
+                for r in db_read("SELECT post_order, status FROM invoices WHERE entity=?", (entity_key,))}
+
+    now       = datetime.now().isoformat()
+    ops       = []
+    new_count = 0
+    skipped   = 0
+
+    for branch_id, branch_code, outlet_code, tx_date, net_sales in rows:
+        net_sales = round(to_float(net_sales), 2)
+        if net_sales == 0:
+            skipped += 1
+            continue
+
+        excl = net_sales
+        vat  = round(excl * VAT_RATE, 2)
+        date_label  = tx_date.strftime("%Y-%m-%d") if hasattr(tx_date, "strftime") else str(tx_date)
+        outlet_name = GL_OUTLET_NAMES.get((branch_code, outlet_code), f"{branch_code}-{outlet_code}")
+
+        h          = int(hashlib.sha1(f"{branch_id}|{outlet_code}|{date_label}".encode()).hexdigest(), 16)
+        post_order = -(h % 900_000_000 + 100_000_000)
+        inv_num    = f"GL-{branch_code}-{outlet_code}-{date_label}"
+        cust_name  = outlet_name
+        cust_id    = f"GL-{branch_code}-{outlet_code}"
+        desc       = (f"Outlet sales ({branch_code} / {outlet_name}) - {date_label} "
+                       f"- GL codes 31001/31002, VAT calculated at 7.5%")
+
+        if post_order in existing:
+            if existing[post_order] != "posted":
+                ops.append((
+                    "UPDATE invoices SET invoice_num=?,customer_name=?,customer_id=?,"
+                    "invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
+                    "invoice_description=?,invoice_type=?,last_synced=? "
+                    "WHERE post_order=? AND entity=?",
+                    (inv_num, cust_name, cust_id, date_label, excl, vat, branch_id,
+                     desc, "Invoice", now, post_order, entity_key),
+                ))
+        else:
+            new_count += 1
+            ops.append((
+                "INSERT INTO invoices "
+                "(post_order,entity,trx_number,invoice_num,customer_name,customer_id,"
+                "customer_tin,customer_email,customer_phone,customer_address,customer_city,"
+                "invoice_date,amount,vat_amount,branch_id,status,invoice_description,invoice_type,cancel_ref,last_synced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                (post_order, entity_key, post_order, inv_num, cust_name, cust_id,
+                 "", "", "", "", "",
+                 date_label, excl, vat, branch_id, desc, "Invoice", "", now),
+            ))
+
+    if ops:
+        db_write_many(ops)
+
+    return {
+        "ok": True, "synced": len(rows) - skipped, "new": new_count, "skipped": skipped,
+        "date_from": date_from, "date_to": date_to, "source": "PostGL-outlet",
+    }
+
+
 # --- FETCH LINE ITEMS ----------------------------------------------------------
 
 def fetch_line_items(entity, auto_index):
@@ -1000,8 +1183,27 @@ def api_sync():
     entity_key = current_entity_key()
     entity     = current_entity()
     data = request.get_json(silent=True) or {}
-    return jsonify(sync_from_sage(entity_key, entity,
-                                  date_from=data.get("date_from"), date_to=data.get("date_to")))
+    date_from = data.get("date_from")
+    date_to   = data.get("date_to")
+
+    r_invnum = sync_from_sage(entity_key, entity, date_from=date_from, date_to=date_to)
+    r_outlet = sync_gl_outlets(entity_key, entity, date_from=date_from, date_to=date_to)
+
+    if not r_invnum.get("ok") and not r_outlet.get("ok"):
+        return jsonify({"ok": False, "error":
+                         f"InvNum: {r_invnum.get('error')} | Outlet: {r_outlet.get('error')}"})
+
+    return jsonify({
+        "ok":         True,
+        "synced":     r_invnum.get("synced", 0) + r_outlet.get("synced", 0),
+        "new":        r_invnum.get("new", 0) + r_outlet.get("new", 0),
+        "date_from":  r_invnum.get("date_from") or r_outlet.get("date_from"),
+        "date_to":    r_invnum.get("date_to") or r_outlet.get("date_to"),
+        "invnum":     {"synced": r_invnum.get("synced", 0), "new": r_invnum.get("new", 0),
+                       "error": r_invnum.get("error")},
+        "outlet":     {"synced": r_outlet.get("synced", 0), "new": r_outlet.get("new", 0),
+                       "skipped": r_outlet.get("skipped", 0), "error": r_outlet.get("error")},
+    })
 
 
 @app.route("/api/post/<int:auto_index>", methods=["POST"])
