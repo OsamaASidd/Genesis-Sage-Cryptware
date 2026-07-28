@@ -621,6 +621,144 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
     }
 
 
+# --- POSTAR CUSTOMER-WISE SYNC (branches with real AR/credit-sale activity) ----
+#
+# Some branches (e.g. Food branch 1/IC, Cinemas branch 12/GDC) have no
+# per-customer DocType 0/1 documents in InvNum, AND no usable GL revenue code
+# (or an unreliable/unrelated VAT account) - but DO have real, named
+# counterparties showing up in dbo.PostAR (the Accounts Receivable ledger).
+#
+# AccountLink is a stable, real per-counterparty identifier here (confirmed:
+# the same AccountLink consistently recurs for the same real-world entity
+# across many transactions, e.g. TECON=118, waltersmith=125, RENAISSANCE=88
+# for branch 1). There is NO clean structured customer-name column, though -
+# the only place a readable name appears is buried in free-text Description
+# strings ("JUN'26 sales invoice-TECON", "Being royalty payment by Filmhouse
+# cinemas"). This function picks the Description of that AccountLink's
+# single LARGEST invoice (Debit) in each month as the display label - a
+# best-effort choice, not a guaranteed-clean name. Some accounts will show
+# unhelpful labels (e.g. "NIP From Genesis", "ACCOUNT RECEIVABLES") because
+# that's genuinely the only text Sage has for them - spot-check after sync.
+#
+# Only Debit is summed (a new invoice/sale raised against the account).
+# Credit (payments received against past invoices) is deliberately excluded -
+# counting it would double the revenue already captured by the Debit side.
+#
+# PostAR has no VAT column at all, so VAT is calculated at 7.5% on top,
+# same convention used for Food branch 1's till sales and the outlet sync.
+
+def sync_postar_customers(entity_key, entity, date_from=None, date_to=None):
+    VAT_RATE = 0.075
+    postar_branches = entity.get("postar_branches") or []
+    if not postar_branches:
+        return {"ok": True, "synced": 0, "new": 0, "source": "PostAR"}
+
+    if not date_from:
+        date_from = "2020-01-01"
+    if not date_to:
+        date_to = date.today().strftime("%Y-%m-%d")
+
+    conn_str = entity_conn_str(entity)
+    try:
+        sage = pyodbc.connect(conn_str, timeout=15)
+    except Exception as e:
+        return {"ok": False, "error": f"DB connection: {e}", "source": "PostAR"}
+
+    try:
+        cursor = sage.cursor()
+        placeholders = ",".join("?" * len(postar_branches))
+        sql = f"""
+            WITH ranked AS (
+                SELECT
+                    par.iTxBranchID, par.AccountLink, par.Description, par.Debit,
+                    par.TxDate,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY par.iTxBranchID, par.AccountLink,
+                                     YEAR(par.TxDate), MONTH(par.TxDate)
+                        ORDER BY par.Debit DESC
+                    ) AS rn
+                FROM dbo.PostAR par
+                WHERE par.iTxBranchID IN ({placeholders})
+                  AND par.Debit > 0
+                  AND par.TxDate >= ? AND par.TxDate < DATEADD(day, 1, CAST(? AS date))
+            )
+            SELECT
+                iTxBranchID, AccountLink,
+                YEAR(TxDate) AS yr, MONTH(TxDate) AS mo,
+                SUM(Debit) AS total_debit,
+                MAX(CASE WHEN rn = 1 THEN Description END) AS label_desc
+            FROM ranked
+            GROUP BY iTxBranchID, AccountLink, YEAR(TxDate), MONTH(TxDate)
+            ORDER BY yr, mo, iTxBranchID, AccountLink
+        """
+        cursor.execute(sql, list(postar_branches) + [date_from, date_to])
+        rows = cursor.fetchall()
+        print(f"[SYNC-POSTAR:{entity_key}] {len(rows)} branch/account/month rows for "
+              f"branches {postar_branches}, {date_from} -> {date_to}")
+    except Exception as e:
+        sage.close()
+        return {"ok": False, "error": str(e), "source": "PostAR"}
+    finally:
+        sage.close()
+
+    existing = {r["post_order"]: r["status"]
+                for r in db_read("SELECT post_order, status FROM invoices WHERE entity=?", (entity_key,))}
+
+    now       = datetime.now().isoformat()
+    ops       = []
+    new_count = 0
+    skipped   = 0
+
+    for branch_id, account_link, yr, mo, total_debit, label_desc in rows:
+        excl = round(to_float(total_debit), 2)
+        if excl == 0:
+            skipped += 1
+            continue
+        vat  = round(excl * VAT_RATE, 2)
+
+        month_label = f"{yr:04d}-{mo:02d}"
+        raw_label   = (label_desc or "").strip()
+        cust_name   = raw_label if raw_label else f"Account {account_link}"
+        cust_id     = f"AR-{account_link}"
+
+        h          = int(hashlib.sha1(f"postar|{branch_id}|{account_link}|{month_label}".encode()).hexdigest(), 16)
+        post_order = -(h % 900_000_000 + 100_000_000)
+        inv_num    = f"AR-{branch_id}-{account_link}-{month_label}"
+        desc       = (f"AR account {account_link} ({raw_label or 'no description'}) - {month_label} "
+                       f"- from dbo.PostAR, VAT calculated at 7.5%")
+
+        if post_order in existing:
+            if existing[post_order] != "posted":
+                ops.append((
+                    "UPDATE invoices SET invoice_num=?,customer_name=?,customer_id=?,"
+                    "invoice_date=?,amount=?,vat_amount=?,branch_id=?,"
+                    "invoice_description=?,invoice_type=?,last_synced=? "
+                    "WHERE post_order=? AND entity=?",
+                    (inv_num, cust_name, cust_id, f"{month_label}-01", excl, vat, branch_id,
+                     desc, "Invoice", now, post_order, entity_key),
+                ))
+        else:
+            new_count += 1
+            ops.append((
+                "INSERT INTO invoices "
+                "(post_order,entity,trx_number,invoice_num,customer_name,customer_id,"
+                "customer_tin,customer_email,customer_phone,customer_address,customer_city,"
+                "invoice_date,amount,vat_amount,branch_id,status,invoice_description,invoice_type,cancel_ref,last_synced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)",
+                (post_order, entity_key, post_order, inv_num, cust_name, cust_id,
+                 "", "", "", "", "",
+                 f"{month_label}-01", excl, vat, branch_id, desc, "Invoice", "", now),
+            ))
+
+    if ops:
+        db_write_many(ops)
+
+    return {
+        "ok": True, "synced": len(rows) - skipped, "new": new_count, "skipped": skipped,
+        "date_from": date_from, "date_to": date_to, "source": "PostAR",
+    }
+
+
 # --- FETCH LINE ITEMS ----------------------------------------------------------
 
 def fetch_line_items(entity, auto_index):
@@ -1188,21 +1326,25 @@ def api_sync():
 
     r_invnum = sync_from_sage(entity_key, entity, date_from=date_from, date_to=date_to)
     r_outlet = sync_gl_outlets(entity_key, entity, date_from=date_from, date_to=date_to)
+    r_postar = sync_postar_customers(entity_key, entity, date_from=date_from, date_to=date_to)
 
-    if not r_invnum.get("ok") and not r_outlet.get("ok"):
+    if not r_invnum.get("ok") and not r_outlet.get("ok") and not r_postar.get("ok"):
         return jsonify({"ok": False, "error":
-                         f"InvNum: {r_invnum.get('error')} | Outlet: {r_outlet.get('error')}"})
+                         f"InvNum: {r_invnum.get('error')} | Outlet: {r_outlet.get('error')} "
+                         f"| PostAR: {r_postar.get('error')}"})
 
     return jsonify({
         "ok":         True,
-        "synced":     r_invnum.get("synced", 0) + r_outlet.get("synced", 0),
-        "new":        r_invnum.get("new", 0) + r_outlet.get("new", 0),
-        "date_from":  r_invnum.get("date_from") or r_outlet.get("date_from"),
-        "date_to":    r_invnum.get("date_to") or r_outlet.get("date_to"),
+        "synced":     r_invnum.get("synced", 0) + r_outlet.get("synced", 0) + r_postar.get("synced", 0),
+        "new":        r_invnum.get("new", 0) + r_outlet.get("new", 0) + r_postar.get("new", 0),
+        "date_from":  r_invnum.get("date_from") or r_outlet.get("date_from") or r_postar.get("date_from"),
+        "date_to":    r_invnum.get("date_to") or r_outlet.get("date_to") or r_postar.get("date_to"),
         "invnum":     {"synced": r_invnum.get("synced", 0), "new": r_invnum.get("new", 0),
                        "error": r_invnum.get("error")},
         "outlet":     {"synced": r_outlet.get("synced", 0), "new": r_outlet.get("new", 0),
                        "skipped": r_outlet.get("skipped", 0), "error": r_outlet.get("error")},
+        "postar":     {"synced": r_postar.get("synced", 0), "new": r_postar.get("new", 0),
+                       "skipped": r_postar.get("skipped", 0), "error": r_postar.get("error")},
     })
 
 
