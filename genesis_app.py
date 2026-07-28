@@ -442,22 +442,25 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
 
 def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
     """
-    Some branches (e.g. till-based QSR/food outlets) never raise DocType 0/1
-    sales documents in dbo.InvNum - every InvNum row for them is a purchase
-    GRV. Their real sales only exist as General Ledger postings. For those
+    Some branches (e.g. till-based QSR/food outlets, or cinemas with no
+    per-customer POS breakdown in Sage) never raise DocType 0/1 sales
+    documents in dbo.InvNum, or their InvNum rows are entirely purchase GRVs.
+    Their real sales only exist as General Ledger postings. For those
     branches (entity["gl_branches"]), build aggregate invoices from
-    dbo.PostGL using the GL codes we were given:
+    dbo.PostGL using GL codes configured per entity:
 
-        31001, 31002  -> net sales
-        23110         -> VAT (where the branch actually has a 23110 sub-account)
+        entity["gl_revenue_codes"]  -> list of net-sales account base-codes
+                                        (e.g. Food: ["31001","31002"],
+                                        Cinemas: ["31103"])
+        entity["gl_vat_code"]       -> VAT account base-code (e.g. "23110")
 
     Two VAT conventions, selected per-branch via entity["vat_calc_branches"]:
-      - Default (branch NOT in vat_calc_branches): 31001/31002 is INCLUSIVE of
-        VAT, and VAT is read directly from that branch's 23110 sub-account.
-        excl = (31001+31002 sum) - (23110 sum)
-      - Branch IN vat_calc_branches (e.g. branch 1/IC, which has no 23110
-        sub-account at all): 31001/31002 is EXCLUSIVE of VAT, and VAT is
-        calculated as 7.5% added on top.
+      - Default (branch NOT in vat_calc_branches): revenue codes sum is
+        INCLUSIVE of VAT, and VAT is read directly from the vat_code
+        sub-account. excl = (revenue sum) - (vat sum)
+      - Branch IN vat_calc_branches (e.g. Food branch 1/IC, which has no VAT
+        sub-account at all): revenue codes sum is EXCLUSIVE of VAT, and VAT
+        is calculated as 7.5% added on top.
         vat = excl * 0.075 ; gross = excl + vat
 
     Grouping granularity, controlled by entity["gl_group_by_client"]:
@@ -466,15 +469,18 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         carry no per-customer identity here.
       - True (e.g. Food): one invoice per branch PER DAY PER CLIENT, using
         dbo.PostGL.cPayeeName as the client identifier. NOTE: this assumes
-        cPayeeName is populated on 31001/31002/23110 postings - verify this
-        looks sensible after the first sync (not blank for everything).
-        Postings with no payee name fall back to a generic "Walk-in Customer"
-        bucket for that branch/day rather than being silently dropped.
+        cPayeeName is populated on the configured revenue/VAT postings -
+        verify this looks sensible after the first sync (not blank for
+        everything). Postings with no payee name fall back to a generic
+        "Walk-in Customer" bucket for that branch/day rather than being
+        silently dropped.
     """
     VAT_RATE          = 0.075
     gl_branches       = entity.get("gl_branches") or []
     vat_calc_branches = set(entity.get("vat_calc_branches") or [])
     group_by_client   = bool(entity.get("gl_group_by_client"))
+    revenue_codes     = entity.get("gl_revenue_codes") or ["31001", "31002"]
+    vat_code          = entity.get("gl_vat_code") or "23110"
     if not gl_branches:
         return {"ok": True, "synced": 0, "new": 0, "source": "PostGL"}
 
@@ -493,6 +499,9 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         cursor = sage.cursor()
         placeholders = ",".join("?" * len(gl_branches))
 
+        revenue_sql = " OR ".join(f"a.Account LIKE '{c}/%'" for c in revenue_codes)
+        vat_sql     = f"a.Account LIKE '{vat_code}/%'"
+
         if group_by_client:
             select_extra = "COALESCE(NULLIF(LTRIM(RTRIM(pg.cPayeeName)), ''), 'Walk-in Customer') AS client_name,"
             group_extra  = ", COALESCE(NULLIF(LTRIM(RTRIM(pg.cPayeeName)), ''), 'Walk-in Customer')"
@@ -506,16 +515,16 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
                 b.cBranchCode    AS branch_code,
                 CAST(pg.TxDate AS DATE) AS tx_date,
                 {select_extra}
-                SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
+                SUM(CASE WHEN {revenue_sql}
                          THEN pg.Credit - pg.Debit ELSE 0 END) AS raw_sales,
-                SUM(CASE WHEN a.Account LIKE '23110/%'
+                SUM(CASE WHEN {vat_sql}
                          THEN pg.Credit - pg.Debit ELSE 0 END) AS vat_from_gl
             FROM dbo.PostGL pg
             JOIN dbo.Accounts a     ON a.AccountLink = pg.AccountLink
             JOIN dbo._etblBranch b ON b.idBranch = pg.iTxBranchID
             WHERE pg.iTxBranchID IN ({placeholders})
               AND pg.TxDate >= ? AND pg.TxDate < DATEADD(day, 1, CAST(? AS date))
-              AND (a.Account LIKE '31001/%' OR a.Account LIKE '31002/%' OR a.Account LIKE '23110/%')
+              AND (({revenue_sql}) OR ({vat_sql}))
             GROUP BY pg.iTxBranchID, b.cBranchCode, CAST(pg.TxDate AS DATE){group_extra}
             ORDER BY tx_date, branch_id
         """
@@ -584,7 +593,8 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
         date_label = tx_date.strftime("%Y-%m-%d") if hasattr(tx_date, "strftime") else str(tx_date)
         vat_note   = ("VAT calculated at 7.5% on top of exclusive net sales"
                       if int(branch_id) in vat_calc_branches
-                      else "VAT per GL code 23110")
+                      else f"VAT per GL code {vat_code}")
+        revenue_label = "/".join(revenue_codes)
 
         if group_by_client:
             slug        = re.sub(r"[^A-Za-z0-9]+", "-", client_name).strip("-").upper()[:24] or "CUST"
@@ -596,7 +606,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
             cust_name   = client_name
             cust_id     = f"GL-{branch_code}-{slug}"
             desc        = (f"Aggregate sales ({branch_code}, {client_name}) - {date_label} "
-                            f"- GL codes 31001/31002 (net sales), {vat_note}")
+                            f"- GL code(s) {revenue_label} (net sales), {vat_note}")
         else:
             # Stable synthetic ID (negative, so it can never collide with a
             # real InvNum AutoIndex, which is always positive).
@@ -606,7 +616,7 @@ def sync_gl_branches(entity_key, entity, date_from=None, date_to=None):
             cust_name   = f"Walk-in Customers - {branch_code}"
             cust_id     = f"GL-{branch_code}"
             desc        = (f"Aggregate branch sales ({branch_code}) - {date_label} "
-                            f"- GL codes 31001/31002 (net sales), {vat_note}")
+                            f"- GL code(s) {revenue_label} (net sales), {vat_note}")
 
         if post_order in existing:
             if existing[post_order] != "posted":
