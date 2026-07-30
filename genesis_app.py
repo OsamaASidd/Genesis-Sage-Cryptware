@@ -449,7 +449,10 @@ def sync_from_sage(entity_key, entity, date_from=None, date_to=None):
 #
 # This is deliberately NOT customer-wise (no customer exists in the source
 # data) - it's outlet-wise, which is what the client's mapping file actually
-# describes. Revenue comes from GL codes 31001/31002 only; VAT is CALCULATED
+# describes. Revenue comes from the full Food revenue ledger (GL_REVENUE_CODES
+# below: 31001 Food, 31002 Drinks, 31003 Laundry, 31004 Housekeeping, 31005
+# Accommodation, 31006 Hall - QSR/FCT/SKY typically only use 31001/31002,
+# PHT's hotel properties use all six); VAT is CALCULATED
 # at 7.5% (not read from 23110 - proven unreliable/uncorrelated earlier in
 # this investigation), matching the same convention already used for
 # Food branch 1.
@@ -508,6 +511,16 @@ GL_OUTLET_NAMES = {
     ("PHT", "PAK"): "GENESIS PARK",
 }
 
+# Genesis Food's full revenue ledger, per client confirmation:
+#   31001 - Food          31004 - Housekeeping
+#   31002 - Drinks         31005 - Accommodation
+#   31003 - Laundry        31006 - Hall
+# QSR/FCT/SKY outlets typically only post to 31001/31002 (food + drinks);
+# PHT's hotel properties post to all six (laundry/housekeeping/accommodation/
+# hall are real hotel revenue that was previously missed when only
+# 31001/31002 were summed).
+GL_REVENUE_CODES = ["31001", "31002", "31003", "31004", "31005", "31006"]
+
 
 def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
     """
@@ -534,20 +547,21 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
     try:
         cursor = sage.cursor()
         placeholders = ",".join("?" * len(gl_branches))
+        revenue_sql = " OR ".join(f"a.Account LIKE '{c}/%'" for c in GL_REVENUE_CODES)
         sql = f"""
             SELECT
                 pg.iTxBranchID AS branch_id,
                 b.cBranchCode  AS branch_code,
                 PARSENAME(REPLACE(a.Account, '/', '.'), 1) AS outlet_code,
                 CAST(pg.TxDate AS DATE) AS tx_date,
-                SUM(CASE WHEN a.Account LIKE '31001/%' OR a.Account LIKE '31002/%'
+                SUM(CASE WHEN {revenue_sql}
                          THEN pg.Credit - pg.Debit ELSE 0 END) AS net_sales
             FROM dbo.PostGL pg
             JOIN dbo.Accounts a     ON a.AccountLink = pg.AccountLink
             JOIN dbo._etblBranch b ON b.idBranch = pg.iTxBranchID
             WHERE pg.iTxBranchID IN ({placeholders})
               AND pg.TxDate >= ? AND pg.TxDate < DATEADD(day, 1, CAST(? AS date))
-              AND (a.Account LIKE '31001/%' OR a.Account LIKE '31002/%')
+              AND ({revenue_sql})
             GROUP BY pg.iTxBranchID, b.cBranchCode,
                      PARSENAME(REPLACE(a.Account, '/', '.'), 1), CAST(pg.TxDate AS DATE)
             ORDER BY tx_date, branch_id, outlet_code
@@ -587,7 +601,7 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
         cust_name  = outlet_name
         cust_id    = f"GL-{branch_code}-{outlet_code}"
         desc       = (f"Outlet sales ({branch_code} / {outlet_name}) - {date_label} "
-                       f"- GL codes 31001/31002, VAT calculated at 7.5%")
+                       f"- GL codes {'/'.join(GL_REVENUE_CODES)}, VAT calculated at 7.5%")
 
         if post_order in existing:
             if existing[post_order] != "posted":
