@@ -509,6 +509,12 @@ GL_OUTLET_NAMES = {
     ("PHT", "JEY"): "JERSEY",
     ("PHT", "SOP"): "REVENTON PARK",
     ("PHT", "PAK"): "GENESIS PARK",
+    # GDC (Cinemas) locations - real revenue confirmed via 31103, but no name
+    # mapping has been provided by the client yet (unlike Food's QSR sheet).
+    # Falls back to "GDC-<code>" via GL_OUTLET_NAMES.get() until a mapping
+    # sheet is provided - do NOT guess city names here for a tax document.
+    # Known codes so far: CWA, CAA, CPH, COW, CMA, CFE, CAB, CBN, CSA, CAC,
+    # CPA, CAV, CPM, CAM, CWK, PHV
 }
 
 # Genesis Food's full revenue ledger, per client confirmation:
@@ -527,9 +533,16 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
     Outlet-wise aggregate sync for till-only branches (entity["gl_outlet_branches"]).
     One invoice per branch per outlet per day. See module notes above for the
     revenue/VAT convention and known mapping conflicts.
+
+    Revenue codes default to Food's ledger (GL_REVENUE_CODES) but can be
+    overridden per entity via entity["gl_revenue_codes"] - e.g. Cinemas uses
+    ["31103"] (confirmed real revenue account for GDC, distinct from Food's
+    31001-31006; GDC's 23110 VAT account was checked and does NOT correlate
+    reliably with 31103, so VAT is calculated at 7.5% here too, same as Food).
     """
     VAT_RATE = 0.075
-    gl_branches = entity.get("gl_outlet_branches") or []
+    gl_branches   = entity.get("gl_outlet_branches") or []
+    revenue_codes = entity.get("gl_revenue_codes") or GL_REVENUE_CODES
     if not gl_branches:
         return {"ok": True, "synced": 0, "new": 0, "source": "PostGL-outlet"}
 
@@ -547,7 +560,7 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
     try:
         cursor = sage.cursor()
         placeholders = ",".join("?" * len(gl_branches))
-        revenue_sql = " OR ".join(f"a.Account LIKE '{c}/%'" for c in GL_REVENUE_CODES)
+        revenue_sql = " OR ".join(f"a.Account LIKE '{c}/%'" for c in revenue_codes)
         sql = f"""
             SELECT
                 pg.iTxBranchID AS branch_id,
@@ -601,7 +614,7 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
         cust_name  = outlet_name
         cust_id    = f"GL-{branch_code}-{outlet_code}"
         desc       = (f"Outlet sales ({branch_code} / {outlet_name}) - {date_label} "
-                       f"- GL codes {'/'.join(GL_REVENUE_CODES)}, VAT calculated at 7.5%")
+                       f"- GL codes {'/'.join(revenue_codes)}, VAT calculated at 7.5%")
 
         if post_order in existing:
             if existing[post_order] != "posted":
