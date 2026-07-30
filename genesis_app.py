@@ -1353,7 +1353,7 @@ def index():
         page        = max(1, min(page, total_pages))
         offset      = (page - 1) * PER_PAGE
         invoices    = db_read(
-            f"SELECT * FROM invoices {where_sql} ORDER BY post_order DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM invoices {where_sql} ORDER BY invoice_date DESC, post_order DESC LIMIT ? OFFSET ?",
             tuple(params) + (PER_PAGE, offset))
     except Exception as e:
         print(f"[INDEX] error: {e}")
