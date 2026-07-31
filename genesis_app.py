@@ -523,7 +523,9 @@ GL_OUTLET_NAMES = {
     ("PHT", "JEY"): "JERSEY",
     ("PHT", "SOP"): "REVENTON PARK",
     ("PHT", "PAK"): "GENESIS PARK",
-    # GDC (Cinemas) locations - real revenue confirmed via 31103, but no name
+    # GDC (Cinemas) locations - real revenue confirmed via 31103 (Concession);
+    # 31101 (Box Office) and 31102 (Commercial) are the other two ledgers in
+    # GDC's 3-ledger revenue structure, per client confirmation - but no name
     # mapping has been provided by the client yet (unlike Food's QSR sheet).
     # Falls back to "GDC-<code>" via GL_OUTLET_NAMES.get() until a mapping
     # sheet is provided - do NOT guess city names here for a tax document.
@@ -572,9 +574,12 @@ def sync_gl_outlets(entity_key, entity, date_from=None, date_to=None):
 
     Revenue codes default to Food's ledger (GL_REVENUE_CODES) but can be
     overridden per entity via entity["gl_revenue_codes"] - e.g. Cinemas uses
-    ["31103"] (confirmed real revenue account for GDC, distinct from Food's
-    31001-31006; GDC's 23110 VAT account was checked and does NOT correlate
-    reliably with 31103, so VAT is calculated at 7.5% here too, same as Food).
+    ["31101", "31102", "31103"] (GDC's 3-ledger revenue structure per client
+    confirmation: 31101 Box Office, 31102 Commercial, 31103 Concession -
+    31103 was confirmed as real revenue directly; 31101/31102 follow the
+    same account-code family so treated the same way. GDC's 23110 VAT
+    account was checked and does NOT correlate reliably with 31103, so VAT
+    is calculated at 7.5% here too, same as Food).
     """
     VAT_RATE = 0.075
     gl_branches   = entity.get("gl_outlet_branches") or []
