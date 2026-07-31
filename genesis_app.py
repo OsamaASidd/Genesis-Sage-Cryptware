@@ -1414,9 +1414,13 @@ def api_sync():
     })
 
 
-@app.route("/api/post/<int:auto_index>", methods=["POST"])
+@app.route("/api/post/<auto_index>", methods=["POST"])
 @login_required
 def api_post(auto_index):
+    try:
+        auto_index = int(auto_index)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid invoice id"}), 400
     return jsonify(post_to_firs(auto_index, current_entity_key(), current_entity()))
 
 
@@ -1433,9 +1437,13 @@ def api_post_bulk():
     return jsonify({"ok": True, "posted": posted, "failed": len(results)-posted, "details": results})
 
 
-@app.route("/api/preview-payload/<int:auto_index>")
+@app.route("/api/preview-payload/<auto_index>")
 @login_required
 def api_preview_payload(auto_index):
+    try:
+        auto_index = int(auto_index)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid invoice id"}), 400
     entity_key = current_entity_key()
     entity     = current_entity()
     inv = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
@@ -1454,9 +1462,13 @@ def api_preview_payload(auto_index):
     })
 
 
-@app.route("/api/error-details/<int:auto_index>")
+@app.route("/api/error-details/<auto_index>")
 @login_required
 def api_error_details(auto_index):
+    try:
+        auto_index = int(auto_index)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid invoice id"}), 400
     entity_key = current_entity_key()
     inv = db_read_one(
         "SELECT post_order, invoice_num, customer_name, status, error_message, api_response "
@@ -1500,9 +1512,13 @@ def api_stats():
         return jsonify({"ok": False, "error": str(e)})
 
 
-@app.route("/api/debug-lines/<int:auto_index>")
+@app.route("/api/debug-lines/<auto_index>")
 @login_required
 def api_debug_lines(auto_index):
+    try:
+        auto_index = int(auto_index)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid invoice id"}), 400
     entity_key       = current_entity_key()
     entity           = current_entity()
     inv              = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
@@ -1612,9 +1628,13 @@ def api_debug_sage():
         return jsonify({"ok": False, "error": str(e)})
 
 
-@app.route("/download/<int:auto_index>")
+@app.route("/download/<auto_index>")
 @login_required
 def download_pdf(auto_index):
+    try:
+        auto_index = int(auto_index)
+    except (TypeError, ValueError):
+        return "Invalid invoice id", 400
     entity_key = current_entity_key()
     entity     = current_entity()
     inv = db_read_one("SELECT * FROM invoices WHERE post_order=? AND entity=?", (auto_index, entity_key))
